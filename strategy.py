@@ -238,17 +238,17 @@ def select_stocks(ContextInfo):
         for code in limit_up_candidates:
             # A. 60日最大回撤 < 15%
             if not check_drawdown(ContextInfo, code):
-                # print(f"剔除 {code}: 最大回撤超标")
+                #print(f"剔除 {code}: 最大回撤超标")
                 continue
                 
             # B. Level-2 逻辑 (封单、撤单、炸板)
             if not check_level2_metrics(ContextInfo, code):
-                # print(f"剔除 {code}: Level-2指标不满足")
+                #print(f"剔除 {code}: Level-2指标不满足")
                 continue
                 
             # C. 龙虎榜逻辑 (卖方机构 <= 1)
             if not check_lhb_metrics(ContextInfo, code):
-                # print(f"剔除 {code}: 龙虎榜指标不满足")
+                print(f"剔除 {code}: 龙虎榜指标不满足")
                 continue
                 
             final_list.append(code)
@@ -361,8 +361,10 @@ def check_drawdown(ContextInfo, code):
             dd = (rolling_max - lows[i]) / rolling_max
             if dd > max_drawdown:
                 max_drawdown = dd
-                
-        return max_drawdown < ContextInfo.params['drawdown_limit']
+        is_pass = max_drawdown >= ContextInfo.params['drawdown_limit']
+        if is_pass:
+            print(f"剔除 {code}: 60日最大回撤 {max_drawdown:.2%}，高于 {ContextInfo.params['drawdown_limit']:.2%}")
+        return not is_pass
     except Exception as e:
         print(f"回撤计算异常 {code}: {e}")
         return False
@@ -395,6 +397,7 @@ def check_level2_metrics(ContextInfo, code):
         circulating_cap = get_circulating_cap(ContextInfo, code)
         if circulating_cap > 0:
             if (seal_amount / circulating_cap) <= ContextInfo.params['seal_circ_ratio']:
+                print(f"剔除 {code}: 封单金额占流通市值 {seal_amount/circulating_cap:.2%}，低于 {ContextInfo.params['seal_circ_ratio']:.2%}")
                 return False
         else:
             pass 
@@ -403,6 +406,7 @@ def check_level2_metrics(ContextInfo, code):
         amount = tick_data.get('amount', 0) # 总成交额
         if amount > 0:
             if (seal_amount / amount) <= ContextInfo.params['seal_turnover_ratio']:
+                print(f"剔除 {code}: 封单金额占成交额 {seal_amount/amount:.2%}，低于 {ContextInfo.params['seal_turnover_ratio']:.2%}")
                 return False
                 
         return True
