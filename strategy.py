@@ -7,6 +7,9 @@ import time
 def init(ContextInfo):
     try:
         print(">>> 策略正在初始化 (init)...")
+        # 打印 ContextInfo 的属性，以便调试 API 差异
+        #print(f"DEBUG: ContextInfo dir: {dir(ContextInfo)}")
+
         # 1. 设置股票池为沪深A股
         # 注意：如果 sector 名称不对，这里可能会报错
         try:
@@ -26,7 +29,7 @@ def init(ContextInfo):
             'new_stock_days': 60,          # 次新股判定天数
             
             'drawdown_days': 60,           # 最大回撤计算周期
-            'drawdown_limit': 0.15,        # 最大回撤限制 (15%)
+            'drawdown_limit': 0.20,        # 最大回撤限制 (20%)
             
             'seal_circ_ratio': 0.03,       # 封单金额/流通市值 > 3%
             'seal_turnover_ratio': 2.0,    # 封单金额/成交额 > 2倍
@@ -118,7 +121,16 @@ def check_holdings(ContextInfo):
     - 止损：-2%。
     """
     try:
-        positions = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
+        positions = []
+        # 尝试调用全局函数 get_trade_detail_data
+        if 'get_trade_detail_data' in globals():
+            positions = get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
+        elif hasattr(ContextInfo, 'get_trade_detail_data'):
+            positions = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
+        else:
+            print("错误: 无法找到 get_trade_detail_data (既不是全局函数也不是ContextInfo方法)")
+            return
+
         if not positions:
             return
 
@@ -134,22 +146,43 @@ def check_holdings(ContextInfo):
             # 止损逻辑
             if profit_pct <= ContextInfo.params['stop_loss']:
                 print(f"[止损触发] {code} 当前价格:{current_price} 成本:{cost_price} 盈亏:{profit_pct:.2%}")
-                ContextInfo.order_stock(code, -pos.m_nVolume, ContextInfo.account_id) # 卖出
+                do_sell(ContextInfo, code, pos.m_nVolume)
                 continue
                 
-            # 止盈逻辑 (简化版，复杂的时间判断需在分钟级别回测或实盘Timer中实现)
+            # 止盈逻辑 (简化版)
             if profit_pct >= ContextInfo.params['stop_profit']:
                 # 检查是否涨停 (简单判断)
                 is_limit_up = check_is_limit_up_now(ContextInfo, code)
                 if not is_limit_up:
                     print(f"[止盈触发] {code} 当前价格:{current_price} 成本:{cost_price} 盈亏:{profit_pct:.2%}")
-                    ContextInfo.order_stock(code, -pos.m_nVolume, ContextInfo.account_id)
+                    do_sell(ContextInfo, code, pos.m_nVolume)
                 else:
-                    # 打印一条日志说明持有理由
-                    # print(f"[止盈保留] {code} 达到止盈线但当前涨停，继续持有")
                     pass
     except Exception as e:
         print(f"check_holdings 异常: {e}")
+
+def do_sell(ContextInfo, code, volume):
+    """执行卖出操作"""
+    try:
+        # 尝试使用 pass_order (QMT 标准下单函数)
+        # opType: 24 (卖出), orderType: 1101 (限价委托 - 这里为了快速成交，可用市价或对手价，这里暂演示限价)
+        # 注意：实际使用需确认 pass_order 参数定义
+        if 'pass_order' in globals():
+            # 获取最新价作为卖出价
+            tick = ContextInfo.get_full_tick([code])
+            price = tick[code]['lastPrice'] if code in tick else 0
+            if price > 0:
+                pass_order(24, 1101, ContextInfo.account_id, code, 11, price, volume, "一进二策略", 2, "", ContextInfo)
+                print(f"调用 pass_order 卖出: {code} {volume}股 @ {price}")
+            else:
+                print(f"卖出失败: 无法获取 {code} 价格")
+        elif hasattr(ContextInfo, 'order_stock'):
+            ContextInfo.order_stock(code, -volume, ContextInfo.account_id)
+        else:
+            print("错误: 无法找到下单函数 pass_order 或 order_stock")
+    except Exception as e:
+        print(f"卖出操作异常: {e}")
+
 
 def select_stocks(ContextInfo):
     """
@@ -260,19 +293,40 @@ def is_limit_up_bar(code, bar):
     try:
         close = bar['close']
         pre_close = bar['preClose']
+        high = bar['high']
+        
         if pre_close <= 0: return False
         
-        # 计算涨幅
+        # 1. 基础检查：收盘价必须等于最高价 (未炸板)
+        if abs(close - high) > 0.01:
+            return False
+            
+        # 2. 确定涨停幅度
+        limit_ratio = 0.10 # 默认主板 10%
+        if code.startswith('30') or code.startswith('68'):
+            limit_ratio = 0.20
+        elif code.startswith('8') or code.startswith('4'):
+            limit_ratio = 0.30
+            
+        # 3. 计算理论涨停价
+        # QMT/A股规则：涨停价 = round(昨收 * (1+涨幅), 2)
+        # 注意：Python round是偶数舍入，金融计算通常需四舍五入。
+        # 这里使用简单容差判断：只要涨幅足够接近限制即可
+        
         pct = (close - pre_close) / pre_close
         
-        # 简单阈值判断
-        threshold = 0.098 # 主板10%
-        if code.startswith('30') or code.startswith('68'):
-            threshold = 0.198
+        # 容差判断：
+        # 对于低价股 (如 1.54 -> 1.69, 涨幅 9.74%)，阈值设为 9.0% 比较安全，配合 close==high
+        # 对于 20% 涨幅，设为 19%
+        # 对于 30% 涨幅，设为 29%
         
-        # 严格判断：收盘价等于涨停价 (这里简化为涨幅超过阈值且High==Close)
-        return pct > threshold and abs(bar['high'] - close) < 0.01
-    except:
+        threshold = limit_ratio - 0.015 # 比如 10% -> 8.5%, 宽松一点，依靠 close==high 过滤
+        if pct < threshold:
+            return False
+            
+        return True
+    except Exception as e:
+        # print(f"is_limit_up_bar error {code}: {e}")
         return False
 
 def check_drawdown(ContextInfo, code):
@@ -379,12 +433,23 @@ def place_orders(ContextInfo):
         
         # 计算买入数量
         # 获取可用资金
-        capital = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'account')
-        if not capital: 
-            print("错误：无法获取资金账号信息")
-            return
-            
-        available_cash = capital[0].m_dAvailable
+        available_cash = 0.0
+        try:
+            if 'get_trade_detail_data' in globals():
+                capital = get_trade_detail_data(ContextInfo.account_id, 'stock', 'account')
+                if capital:
+                    available_cash = capital[0].m_dAvailable
+            elif hasattr(ContextInfo, 'get_trade_detail_data'):
+                capital = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'account')
+                if capital:
+                    available_cash = capital[0].m_dAvailable
+            else:
+                 print("错误: 无法获取资金信息 (get_trade_detail_data 缺失)")
+                 return
+        except Exception as e:
+             print(f"获取资金异常: {e}")
+             return
+             
         print(f"可用资金: {available_cash}")
         
         # 获取涨停价 (作为买入价)
@@ -400,7 +465,15 @@ def place_orders(ContextInfo):
             
             if volume > 0:
                 print(f"执行买入指令: {target}, 价格 {limit_up_price}, 数量 {volume}")
-                ContextInfo.buy_code(target, limit_up_price, volume)
+                if 'pass_order' in globals():
+                    # opType: 23 (买入), orderType: 1101 (限价)
+                    pass_order(23, 1101, ContextInfo.account_id, target, 11, limit_up_price, volume, "一进二策略", 2, "", ContextInfo)
+                elif hasattr(ContextInfo, 'order_stock'):
+                    ContextInfo.order_stock(target, volume, ContextInfo.account_id)
+                elif hasattr(ContextInfo, 'buy_code'):
+                    ContextInfo.buy_code(target, limit_up_price, volume)
+                else:
+                    print("错误: 无法下单，ContextInfo 缺少 order_stock 或 buy_code 方法")
             else:
                 print("资金不足，无法下单。")
         else:
@@ -420,10 +493,52 @@ def get_circulating_cap(ContextInfo, code):
 def check_is_limit_up_now(ContextInfo, code):
     """检查当前是否涨停"""
     try:
+        # 获取实时行情
         tick = ContextInfo.get_full_tick([code])
-        if code in tick:
-            # Placeholder
-            return False 
-        return False
-    except:
+        if code not in tick:
+            return False
+            
+        last_price = tick[code]['lastPrice']
+        high_price = tick[code]['high']
+        
+        # 1. 用户建议的核心逻辑：收盘价(最新价) == 最高价
+        # 考虑到浮点数精度，使用差值判断
+        if abs(last_price - high_price) > 0.01:
+            return False
+            
+        # 2. 补充校验：涨幅必须达到涨停板水平，防止普通上涨被误判
+        pre_close = 0.0
+        
+        # 尝试获取昨收
+        if hasattr(ContextInfo, 'get_last_close'):
+            pre_close = ContextInfo.get_last_close(code)
+            
+        # 如果 get_last_close 失败或返回0，尝试从 tick 计算 (有些接口 tick['lastClose'] 存在)
+        if pre_close <= 0:
+             # 简单的 fallback：如果获取不到昨收，就只能暂时信任 last == high
+             # 但为了安全，最好还是返回 False (宁可卖错，不可被套)
+             # 或者尝试用 get_market_data_ex
+             return False
+
+        if pre_close > 0:
+            # 计算涨幅
+            pct = (last_price - pre_close) / pre_close
+            
+            # 设定阈值
+            limit_threshold = 0.095 # 主板 10%
+            
+            # 创业板/科创板 20%
+            if code.startswith('30') or code.startswith('68'):
+                limit_threshold = 0.195
+            # 北交所 30%
+            elif code.startswith('8') or code.startswith('4'):
+                limit_threshold = 0.295
+            # ST股 5% (简单判断，如需严谨需查名)
+            
+            if pct < limit_threshold:
+                return False
+                
+        return True
+    except Exception as e:
+        # print(f"判断涨停异常 {code}: {e}")
         return False
