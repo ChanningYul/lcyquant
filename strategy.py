@@ -5,10 +5,21 @@ import datetime
 import time
 import json
 import os
+import sys
 import threading
 
 # 全局配置文件路径
 CANDIDATE_FILE = "e:/work/job/lcyquant/candidate.json"
+SELECT_LOG = "e:/work/job/lcyquant/select.log"
+
+def log_selection(msg):
+    """写选股日志"""
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(SELECT_LOG, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {msg}\n")
+    except Exception as e:
+        print(f"日志写入失败: {e}")
 
 def init(ContextInfo):
     try:
@@ -36,7 +47,7 @@ def init(ContextInfo):
         start_date = "2023-01-01"
 
         # 任务1: 下午选股 (每天 15:30 启动线程)
-        ContextInfo.run_time("run_selection_task", "1d", f"{start_date} 23:39:00", "SH")
+        ContextInfo.run_time("run_selection_task", "1d", f"{start_date} 00:38:00", "SH")
         
         # 任务2: 晚上挂单 (每天 21:00 启动)
         ContextInfo.run_time("run_night_order_task", "1d", f"{start_date} 21:00:00", "SH")
@@ -184,7 +195,9 @@ def run_selection_task(ContextInfo):
             
         # 5. 启动子线程进行复杂计算和文件IO
         # 将数据传递给子线程，避免子线程调API
-        t = threading.Thread(target=thread_selection_logic_pure, args=(ContextInfo, limit_up_candidates, data_60d))
+        # 提取所需的参数值，不传递 ContextInfo 对象
+        drawdown_limit = ContextInfo.params['drawdown_limit']
+        t = threading.Thread(target=thread_selection_logic_pure, args=(limit_up_candidates, data_60d, drawdown_limit))
         t.start()
         
     except Exception as e:
@@ -199,30 +212,40 @@ def run_night_order_task(ContextInfo):
 def run_morning_check_task(ContextInfo):
     """启动晨间校验任务"""
     print(f"[{datetime.datetime.now()}] 触发晨间校验任务...")
-    t = threading.Thread(target=thread_morning_check, args=(ContextInfo,))
-    t.start()
+    # 晨间校验涉及交易API调用(查询委托)和可能的补单，强烈建议在主线程运行
+    # 避免子线程调用 QMT API 导致崩溃
+    thread_morning_check(ContextInfo)
 
 # ==========================================
 # 业务逻辑层 (Business Logic in Threads)
 # ==========================================
 
-def thread_selection_logic_pure(ContextInfo, limit_up_candidates, data_60d):
-    """【子线程】纯计算选股逻辑并写入文件 (不调QMT API)"""
+def thread_selection_logic_pure(limit_up_candidates, data_60d, drawdown_limit):
+    """【子线程】纯计算选股逻辑并写入文件 (不调QMT API, 不依赖 ContextInfo)"""
     try:
         print(">>> [子线程] 开始执行选股筛选(纯计算)...")
+        log_selection(f"=== 开始新一轮选股筛选 (候选 {len(limit_up_candidates)} 只) ===")
+        sys.stdout.flush()
         
         final_list = []
+        rejected_count = 0
+        
         for code in limit_up_candidates:
             # 传递 data_60d 给 check_drawdown_from_data
             if code not in data_60d: continue
             df = data_60d[code]
             
-            if not check_drawdown_from_data(ContextInfo, code, df): continue
-            # if not check_level2_metrics... (需提前准备数据，暂略)
+            if not check_drawdown_from_data(code, df, drawdown_limit): 
+                rejected_count += 1
+                continue
             
             final_list.append(code)
+            log_selection(f"入选: {code}")
 
         candidates = final_list
+        msg = f"[子线程] 筛选完成: 初始 {len(limit_up_candidates)}, 剔除 {rejected_count}, 剩余 {len(candidates)}"
+        print(msg)
+        log_selection(msg)
         
         # 写入 JSON 文件
         data = {
@@ -236,12 +259,14 @@ def thread_selection_logic_pure(ContextInfo, limit_up_candidates, data_60d):
             json.dump(data, f, ensure_ascii=False, indent=4)
             
         print(f"<<< [子线程] 选股完成，结果已保存至 {CANDIDATE_FILE}。共 {len(candidates)} 只。")
+        sys.stdout.flush()
         
     except Exception as e:
         print(f"[子线程] 选股流程异常: {e}")
+        sys.stdout.flush()
 
 def thread_place_orders(ContextInfo):
-    """【主线程/子线程】读取文件并执行隔夜单"""
+    """【主线程】读取文件并执行隔夜单"""
     try:
         print(">>> 开始执行隔夜挂单...")
         
@@ -483,7 +508,7 @@ def is_limit_up_bar(code, bar):
         # print(f"is_limit_up_bar error {code}: {e}")
         return False
 
-def check_drawdown_from_data(ContextInfo, code, df):
+def check_drawdown_from_data(code, df, drawdown_limit):
     """(纯计算) 涨停前 60 日最大回撤＜15%"""
     try:
         if df is None or len(df) < 60:
@@ -506,12 +531,12 @@ def check_drawdown_from_data(ContextInfo, code, df):
             dd = (rolling_max - lows[i]) / rolling_max
             if dd > max_drawdown:
                 max_drawdown = dd
-        is_pass = max_drawdown >= ContextInfo.params['drawdown_limit']
+        is_pass = max_drawdown >= drawdown_limit
         if is_pass:
-            print(f"剔除 {code}: 60日最大回撤 {max_drawdown:.2%}，高于 {ContextInfo.params['drawdown_limit']:.2%}")
+            log_selection(f"剔除 {code}: 60日最大回撤 {max_drawdown:.2%}，高于 {drawdown_limit:.2%}")
         return not is_pass
     except Exception as e:
-        print(f"回撤计算异常 {code}: {e}")
+        log_selection(f"回撤计算异常 {code}: {e}")
         return False
 
 def check_drawdown(ContextInfo, code):
@@ -526,7 +551,7 @@ def check_drawdown(ContextInfo, code):
             subscribe=False
         ).get(code)
         
-        return check_drawdown_from_data(ContextInfo, code, df)
+        return check_drawdown_from_data(code, df, ContextInfo.params['drawdown_limit'])
     except Exception as e:
         print(f"回撤计算异常 {code}: {e}")
         return False
