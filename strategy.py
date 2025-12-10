@@ -3,204 +3,375 @@ import pandas as pd
 import numpy as np
 import datetime
 import time
+import json
+import os
+import threading
+
+# 全局配置文件路径
+CANDIDATE_FILE = "e:/work/job/lcyquant/candidate.json"
 
 def init(ContextInfo):
     try:
         print(">>> 策略正在初始化 (init)...")
-        # 打印 ContextInfo 的属性，以便调试 API 差异
-        #print(f"DEBUG: ContextInfo dir: {dir(ContextInfo)}")
-
-        # 1. 设置股票池为沪深A股
-        # 注意：如果 sector 名称不对，这里可能会报错
-        try:
-            ContextInfo.stock_list = ContextInfo.get_stock_list_in_sector('沪深A股')
-            print(f"获取到 {len(ContextInfo.stock_list)} 只股票")
-        except Exception as e:
-            print(f"获取股票池失败 (可能板块名称不对): {e}")
-            ContextInfo.stock_list = []
+        # 1. 基础初始化
+        ContextInfo.stock_list = ContextInfo.get_stock_list_in_sector('沪深A股')
+        ContextInfo.account_id = 'YOUR_ACCOUNT_ID' # 请替换为实际资金账号
         
         # 2. 策略参数设置
         ContextInfo.params = {
-            'limit_ratio_main': 0.10,      # 主板涨幅限制
-            'limit_ratio_special': 0.20,   # 创业板/科创板涨幅限制 (虽然本策略剔除，但保留逻辑)
-            'limit_ratio_bj': 0.30,        # 北交所
-            
-            'max_price': 200.0,            # 高价股阈值 (示例：200元)
-            'new_stock_days': 60,          # 次新股判定天数
-            
-            'drawdown_days': 60,           # 最大回撤计算周期
-            'drawdown_limit': 0.20,        # 最大回撤限制 (20%)
-            
-            'seal_circ_ratio': 0.03,       # 封单金额/流通市值 > 3%
-            'seal_turnover_ratio': 2.0,    # 封单金额/成交额 > 2倍
-            'withdraw_limit': 0.20,        # 撤单率 < 20%
-            'bomb_limit': 0,               # 炸板次数 <= 0
-            
-            'stop_profit': 0.10,           # 止盈 10%
-            'stop_loss': -0.02,            # 止损 -2%
+            'limit_ratio_main': 0.10,  #沪深A股涨停幅度
+            'limit_ratio_special': 0.20, #创业板涨停幅度
+            'limit_ratio_bj': 0.30, #北交所涨停幅度
+            'max_price': 200.0, #最大持仓价格
+            'drawdown_limit': 0.20, #最大回撤率
+            'stop_profit': 0.10, #止盈比例
+            'stop_loss': -0.02, #止损比例
+            'seal_circ_ratio': 0.03, #封单对流通市值占比
+            'seal_turnover_ratio': 2.0, #封单占成交额倍数
         }
         
-        # 交易相关变量
-        ContextInfo.buy_candidates = []    # 待买入列表
-        ContextInfo.account_id = 'YOUR_ACCOUNT_ID' # 请替换为实际资金账号
+        # 3. 定时任务设置 (ContextInfo.run_time)
+        # 注意：run_time 的 start_time 参数指定“首次运行时间”，配合 period='1d' (1天间隔)，
+        # 即可实现从该日期起，每天固定时间重复执行。此处设置一个过去的日期以确保启动即生效。
+        start_date = "2023-01-01"
+
+        # 任务1: 下午选股 (每天 15:30 启动线程)
+        ContextInfo.run_time("run_selection_task", "1d", f"{start_date} 23:39:00", "SH")
         
-        # 3. 运行控制标记
-        ContextInfo.last_log_time = 0      # 上次打印日志时间
-        ContextInfo.current_date = datetime.date.today() # 当前日期
-        ContextInfo.has_selected = False   # 当日是否已选股
-        ContextInfo.has_ordered = False    # 当日是否已下单
+        # 任务2: 晚上挂单 (每天 21:00 启动)
+        ContextInfo.run_time("run_night_order_task", "1d", f"{start_date} 21:00:00", "SH")
         
-        print("策略初始化完成：一进二打板策略")
-        print("注意：Level-2数据(撤单率/炸板)及龙虎榜数据需要额外数据源支持，本代码包含基础框架。")
+        # 任务3: 早上校验 (每天 09:25 启动线程)
+        ContextInfo.run_time("run_morning_check_task", "1d", f"{start_date} 09:25:00", "SH")
+        
+        print("策略初始化完成：多线程 + 存算分离架构")
     except Exception as e:
         print(f"!!! 策略初始化发生严重错误: {e}")
 
 def handlebar(ContextInfo):
-    try:
-        # 安全检查：防止 init 失败导致 ContextInfo 属性缺失
-        if not hasattr(ContextInfo, 'last_log_time'):
-            ContextInfo.last_log_time = 0
-        if not hasattr(ContextInfo, 'current_date'):
-            ContextInfo.current_date = datetime.date.today()
-        if not hasattr(ContextInfo, 'has_selected'):
-            ContextInfo.has_selected = False
-        if not hasattr(ContextInfo, 'has_ordered'):
-            ContextInfo.has_ordered = False
-        if not hasattr(ContextInfo, 'buy_candidates'):
-            ContextInfo.buy_candidates = []
-        if not hasattr(ContextInfo, 'params'):
-            print("警告: 策略参数未初始化，正在尝试重新初始化...")
-            init(ContextInfo)
-            return
-
-        # 0. 心跳日志 (每5秒)
-        now_time = time.time()
-        if now_time - ContextInfo.last_log_time > 5:
-            print(f"[心跳] 策略运行中... {datetime.datetime.now().strftime('%H:%M:%S')}")
-            ContextInfo.last_log_time = now_time
-            
-        # 检查日期变更 (重置状态)
-        today = datetime.date.today()
-        if today != ContextInfo.current_date:
-            print(f"日期变更: {ContextInfo.current_date} -> {today}，重置策略状态")
-            ContextInfo.current_date = today
-            ContextInfo.has_selected = False
-            ContextInfo.has_ordered = False
-            ContextInfo.buy_candidates = []
-            
-        # 1. 止盈止损监控 (针对现有持仓)
-        # 实盘中建议在盘中高频运行；回测中如果是日线，只能按收盘价或日内High/Low粗略模拟
+    now = time.time()
+    
+    # 初始化计时器
+    if not hasattr(ContextInfo, 'last_log_time'):
+        ContextInfo.last_log_time = 0
+    if not hasattr(ContextInfo, 'last_check_time'):
+        ContextInfo.last_check_time = 0
+        
+    # 每5秒打印一次日志
+    if now - ContextInfo.last_log_time >= 5:
+        print(f"本条提示每5秒打印1次，但止盈止损判断会每1秒执行1次。")
+        ContextInfo.last_log_time = now
+        
+    # 每1秒执行一次持仓检查
+    if now - ContextInfo.last_check_time >= 1:
         check_holdings(ContextInfo)
-        
-        # 获取当前时间
-        current_dt = datetime.datetime.now()
-        
-        # 2. 选股逻辑 (盘后运行，例如 15:01)
-        if not ContextInfo.has_selected:
-            if current_dt.hour >= 15 and current_dt.minute >= 1:
-                print(f"到达选股时间 (15:01)，开始执行选股逻辑...")
-                select_stocks(ContextInfo)
-                ContextInfo.has_selected = True
-                print("选股逻辑执行完毕，今日不再执行。")
-        
-        # 3. 交易执行 (挂隔夜单，例如 20:30)
-        if not ContextInfo.has_ordered:
-            if current_dt.hour >= 20 and current_dt.minute >= 30:
-                print(f"到达下单时间 (20:30)，开始执行挂单逻辑...")
-                place_orders(ContextInfo)
-                ContextInfo.has_ordered = True
-                print("下单逻辑执行完毕，今日不再执行。")
-    except Exception as e:
-        print(f"!!! handlebar 运行异常: {e}")
+        ContextInfo.last_check_time = now
 
 def check_holdings(ContextInfo):
     """
-    持仓管理：止盈止损
-    逻辑：
-    - 止盈：+10%。如果开盘一字板不卖；否则如果9:40前未涨停则卖出。
-    - 止损：-2%。
+    检查持仓，执行止盈止损
     """
     try:
+        # 获取持仓
         positions = []
-        # 尝试调用全局函数 get_trade_detail_data
         if 'get_trade_detail_data' in globals():
             positions = get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
         elif hasattr(ContextInfo, 'get_trade_detail_data'):
             positions = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
-        else:
-            print("错误: 无法找到 get_trade_detail_data (既不是全局函数也不是ContextInfo方法)")
-            return
-
+            
         if not positions:
             return
 
         for pos in positions:
             code = pos.m_strInstrumentID
-            cost_price = pos.m_dOpenPrice # 持仓成本
-            current_price = pos.m_dLastPrice # 最新价
+            volume = pos.m_nVolume
+            can_use_volume = pos.m_nCanUseVolume
+            avg_price = pos.m_dOpenPrice # 开仓均价
             
-            if cost_price <= 0: continue
-            
-            profit_pct = (current_price - cost_price) / cost_price
-            
-            # 止损逻辑
-            if profit_pct <= ContextInfo.params['stop_loss']:
-                print(f"[止损触发] {code} 当前价格:{current_price} 成本:{cost_price} 盈亏:{profit_pct:.2%}")
-                do_sell(ContextInfo, code, pos.m_nVolume)
+            if can_use_volume <= 0:
                 continue
                 
-            # 止盈逻辑 (简化版)
-            if profit_pct >= ContextInfo.params['stop_profit']:
-                # 检查是否涨停 (简单判断)
-                is_limit_up = check_is_limit_up_now(ContextInfo, code)
-                if not is_limit_up:
-                    print(f"[止盈触发] {code} 当前价格:{current_price} 成本:{cost_price} 盈亏:{profit_pct:.2%}")
-                    do_sell(ContextInfo, code, pos.m_nVolume)
-                else:
-                    pass
+            # 获取当前行情
+            last_tick = ContextInfo.get_full_tick([code])
+            if code not in last_tick:
+                continue
+                
+            curr_price = last_tick[code]['lastPrice']
+            
+            # 计算收益率
+            if avg_price <= 0: continue
+            profit_rate = (curr_price - avg_price) / avg_price
+            
+            # 止盈: > 10%
+            if profit_rate >= ContextInfo.params['stop_profit']:
+                print(f"触发止盈: {code}, 收益率 {profit_rate:.2%}")
+                do_sell(ContextInfo, code, curr_price, can_use_volume, "止盈卖出")
+                
+            # 止损: < -2%
+            elif profit_rate <= ContextInfo.params['stop_loss']:
+                print(f"触发止损: {code}, 收益率 {profit_rate:.2%}")
+                do_sell(ContextInfo, code, curr_price, can_use_volume, "止损卖出")
+                
     except Exception as e:
-        print(f"check_holdings 异常: {e}")
+        print(f"持仓检查异常: {e}")
 
-def do_sell(ContextInfo, code, volume):
-    """执行卖出操作"""
+def do_sell(ContextInfo, stock_code, price, volume, msg):
+    """执行卖出"""
     try:
-        # 尝试使用 pass_order (QMT 标准下单函数)
-        # opType: 24 (卖出), orderType: 1101 (限价委托 - 这里为了快速成交，可用市价或对手价，这里暂演示限价)
-        # 注意：实际使用需确认 pass_order 参数定义
+        print(f"执行卖出: {stock_code}, 价格 {price}, 数量 {volume}, 原因: {msg}")
         if 'pass_order' in globals():
-            # 获取最新价作为卖出价
-            tick = ContextInfo.get_full_tick([code])
-            price = tick[code]['lastPrice'] if code in tick else 0
-            if price > 0:
-                pass_order(24, 1101, ContextInfo.account_id, code, 11, price, volume, "一进二策略", 2, "", ContextInfo)
-                print(f"调用 pass_order 卖出: {code} {volume}股 @ {price}")
-            else:
-                print(f"卖出失败: 无法获取 {code} 价格")
-        elif hasattr(ContextInfo, 'order_stock'):
-            ContextInfo.order_stock(code, -volume, ContextInfo.account_id)
+            # 24:卖出, 1101:限价
+            pass_order(24, 1101, ContextInfo.account_id, stock_code, 11, price, volume, msg, 2, "", ContextInfo)
         else:
-            print("错误: 无法找到下单函数 pass_order 或 order_stock")
+            ContextInfo.sell_stock(stock_code, volume, ContextInfo.account_id)
     except Exception as e:
-        print(f"卖出操作异常: {e}")
+        print(f"卖出异常: {e}")
 
+# ==========================================
+# 任务调度层 (Task Scheduler)
+# ==========================================
 
-def select_stocks(ContextInfo):
+def run_selection_task(ContextInfo):
+    """启动选股任务（主线程获取数据，子线程纯计算）"""
+    try:
+        print(f" 触发选股任务，开始在主线程准备数据...")
+        
+        # 1. 基础过滤 (Main Thread)
+        basic_pool = filter_basic_criteria(ContextInfo)
+        if not basic_pool:
+            print("基础过滤后无股票，结束选股。")
+            return
+
+        # 2. 批量获取3日数据用于涨停判断 (Main Thread)
+        # 获取大量数据，可能需要1-2秒
+        data_3d = ContextInfo.get_market_data_ex(
+            ['close', 'preClose', 'high', 'amount', 'open'], 
+            basic_pool, 
+            period='1d', 
+            count=3, 
+            subscribe=False
+        )
+        
+        # 3. 初筛涨停股 (Main Thread - 快速)
+        limit_up_candidates = []
+        for code in basic_pool:
+            if code not in data_3d: continue
+            df = data_3d[code]
+            if len(df) < 3: continue
+            
+            bar_t = df.iloc[-1]
+            bar_prev = df.iloc[-2]
+            
+            if is_limit_up_bar(code, bar_t) and not is_limit_up_bar(code, bar_prev):
+                limit_up_candidates.append(code)
+                
+        print(f"初筛涨停股数量: {len(limit_up_candidates)}")
+        
+        if not limit_up_candidates:
+            print("今日无涨停候选股。")
+            # 即使为空也启动线程去写个空文件，保持流程完整
+            
+        # 4. 获取候选股的60日数据用于回撤计算 (Main Thread)
+        data_60d = {}
+        if limit_up_candidates:
+            data_60d = ContextInfo.get_market_data_ex(
+                ['high', 'low'], 
+                limit_up_candidates, 
+                period='1d', 
+                count=63, 
+                subscribe=False
+            )
+            
+        # 5. 启动子线程进行复杂计算和文件IO
+        # 将数据传递给子线程，避免子线程调API
+        t = threading.Thread(target=thread_selection_logic_pure, args=(ContextInfo, limit_up_candidates, data_60d))
+        t.start()
+        
+    except Exception as e:
+        print(f"主线程选股准备阶段异常: {e}")
+
+def run_night_order_task(ContextInfo):
+    """启动夜间挂单任务"""
+    print(f"[{datetime.datetime.now()}] 触发夜间挂单任务...")
+    # 挂单涉及交易账户操作，直接在主线程运行更稳定
+    thread_place_orders(ContextInfo)
+
+def run_morning_check_task(ContextInfo):
+    """启动晨间校验任务"""
+    print(f"[{datetime.datetime.now()}] 触发晨间校验任务...")
+    t = threading.Thread(target=thread_morning_check, args=(ContextInfo,))
+    t.start()
+
+# ==========================================
+# 业务逻辑层 (Business Logic in Threads)
+# ==========================================
+
+def thread_selection_logic_pure(ContextInfo, limit_up_candidates, data_60d):
+    """【子线程】纯计算选股逻辑并写入文件 (不调QMT API)"""
+    try:
+        print(">>> [子线程] 开始执行选股筛选(纯计算)...")
+        
+        final_list = []
+        for code in limit_up_candidates:
+            # 传递 data_60d 给 check_drawdown_from_data
+            if code not in data_60d: continue
+            df = data_60d[code]
+            
+            if not check_drawdown_from_data(ContextInfo, code, df): continue
+            # if not check_level2_metrics... (需提前准备数据，暂略)
+            
+            final_list.append(code)
+
+        candidates = final_list
+        
+        # 写入 JSON 文件
+        data = {
+            "date": datetime.date.today().strftime("%Y-%m-%d"),
+            "candidates": candidates,
+            "timestamp": time.time()
+        }
+        
+        os.makedirs(os.path.dirname(CANDIDATE_FILE), exist_ok=True)
+        with open(CANDIDATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            
+        print(f"<<< [子线程] 选股完成，结果已保存至 {CANDIDATE_FILE}。共 {len(candidates)} 只。")
+        
+    except Exception as e:
+        print(f"[子线程] 选股流程异常: {e}")
+
+def thread_place_orders(ContextInfo):
+    """【主线程/子线程】读取文件并执行隔夜单"""
+    try:
+        print(">>> 开始执行隔夜挂单...")
+        
+        # 1. 读取 JSON
+        if not os.path.exists(CANDIDATE_FILE):
+            print("未找到选股结果文件，跳过挂单。")
+            return
+            
+        with open(CANDIDATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        # 校验日期 (可选：如果是昨晚选的，今天21点挂，日期应该是今天)
+        # 这里假设当天下午选，当天晚上挂
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        if data.get("date") != today_str:
+            print(f"警告：选股文件日期 ({data.get('date')}) 与今日 ({today_str}) 不符，请确认。")
+            # 视情况决定是否继续，这里选择继续但打印警告
+            
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print("选股列表为空，无单可挂。")
+            return
+            
+        # 2. 计算资金并下单
+        # 注意：如果是子线程调用交易接口需谨慎。
+        target = candidates[0] # 示例：只买第一只
+        
+        # 获取资金 (尝试调用全局接口)
+        available_cash = 0.0
+        if 'get_trade_detail_data' in globals():
+            capital = get_trade_detail_data(ContextInfo.account_id, 'stock', 'account')
+            if capital:
+                available_cash = capital[0].m_dAvailable
+                
+        print(f"可用资金: {available_cash}")
+        
+        # 获取收盘价并计算明日涨停价
+        last_tick = ContextInfo.get_full_tick([target])
+        if target in last_tick:
+            curr_price = last_tick[target]['lastPrice']
+            
+            # 计算明日涨停价 (预估 1.10)
+            # 严格计算需要根据板块
+            limit_ratio = 1.10
+            if target.startswith('30') or target.startswith('68'): limit_ratio = 1.20
+            elif target.startswith('8') or target.startswith('4'): limit_ratio = 1.30
+            
+            limit_up_price = round(curr_price * limit_ratio, 2)
+            
+            # 股数计算
+            volume = int(available_cash / limit_up_price / 100) * 100
+            
+            if volume > 0:
+                print(f"执行挂单: {target}, 价格 {limit_up_price}, 数量 {volume}")
+                # 下单
+                if 'pass_order' in globals():
+                    # 23:买入, 1101:限价
+                    pass_order(23, 1101, ContextInfo.account_id, target, 11, limit_up_price, volume, "隔夜单", 2, "", ContextInfo)
+                else:
+                    ContextInfo.order_stock(target, volume, ContextInfo.account_id)
+            else:
+                print("资金不足。")
+        else:
+            print(f"无法获取 {target} 行情")
+            
+        print("<<< 隔夜挂单完成")
+        
+    except Exception as e:
+        print(f"挂单异常: {e}")
+
+def thread_morning_check(ContextInfo):
+    """【子线程】9:25 校验挂单状态"""
+    try:
+        print(">>> [子线程] 开始执行晨间校验...")
+        
+        # 1. 获取当前未成交委托
+        orders = []
+        if 'get_trade_detail_data' in globals():
+            orders = get_trade_detail_data(ContextInfo.account_id, 'stock', 'order')
+            
+        # 2. 读取昨晚的目标股票
+        if not os.path.exists(CANDIDATE_FILE):
+            return
+        with open(CANDIDATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        candidates = data.get("candidates", [])
+        if not candidates: return
+        
+        target = candidates[0]
+        
+        # 3. 检查是否在委托列表中
+        is_ordered = False
+        for order in orders:
+            # 状态：48=未报, 49=待报, 50=已报, 51=已报待撤, 52=部成, 53=部撤, 54=已撤, 55=已成, 56=废单
+            # 只要有有效单即可
+            if order.m_strInstrumentID == target and order.m_nOrderStatus in [48, 49, 50, 51, 52]:
+                is_ordered = True
+                print(f"校验通过：{target} 挂单正常 (状态码 {order.m_nOrderStatus})")
+                break
+                
+        # 4. 如果没成功，补单
+        if not is_ordered:
+            print(f"警告：未检测到 {target} 的有效挂单，尝试补单...")
+            # 重新走一遍下单逻辑 (可以复用 thread_place_orders 的核心逻辑，这里简化调用)
+            thread_place_orders(ContextInfo)
+            
+        print("<<< [子线程] 晨间校验完成")
+            
+    except Exception as e:
+        print(f"[子线程] 校验异常: {e}")
+
+# ==========================================
+# 核心选股函数 (复用原有逻辑，略作封装)
+# ==========================================
+
+def select_stocks_core(ContextInfo):
     """
-    执行选股逻辑
+    纯粹的计算函数，返回 list
     """
-    print(">>> 开始执行选股流程")
+    print(">>> 开始执行核心选股逻辑")
     candidates = []
     
+    # ... (此处保留原有 select_stocks 的大部分逻辑，但改为 return candidates)
+    # 为了减少代码变动，直接调用原有的 filter 和 check 函数
+    
     try:
-        # 1. 基础过滤：剔除ST、创业板、科创板、北交所、次新股、高价股
-        print(f"步骤1: 执行基础过滤...")
+        # 1. 基础过滤
         basic_pool = filter_basic_criteria(ContextInfo)
-        print(f"步骤1完成: 基础过滤后剩余 {len(basic_pool)} 只股票")
         
-        # 2. 批量获取历史数据 (T, T-1, T-2) 以判断一进二
-        # 我们需要判断：今天(T)涨停，昨天(T-1)没涨停
-        # 所以需要 T, T-1, T-2 三天数据来计算涨幅
-        print(f"步骤2: 获取历史数据并筛选首板股票...")
+        # 2. 批量数据
         data_map = ContextInfo.get_market_data_ex(
             ['close', 'preClose', 'high', 'amount', 'open'], 
             basic_pool, 
@@ -215,49 +386,32 @@ def select_stocks(ContextInfo):
             df = data_map[code]
             if len(df) < 3: continue
             
-            # T日 (今天/最近一个收盘日)
             bar_t = df.iloc[-1]
-            # T-1日 (昨天)
             bar_prev = df.iloc[-2]
             
-            # 检查T日是否涨停 (首板)
-            if not is_limit_up_bar(code, bar_t):
-                continue
-                
-            # 检查T-1日是否未涨停 (确保是首板，不是二板或更多)
-            if is_limit_up_bar(code, bar_prev):
-                continue
+            if not is_limit_up_bar(code, bar_t): continue
+            if is_limit_up_bar(code, bar_prev): continue
                 
             limit_up_candidates.append(code)
             
-        print(f"步骤2完成: 筛选出 {len(limit_up_candidates)} 只首板股票")
-        
-        # 3. 进一步筛选：技术指标 & Level-2 & 龙虎榜
-        print(f"步骤3: 执行高级筛选 (回撤/资金/龙虎榜)...")
+        # 3. 高级筛选
         final_list = []
         for code in limit_up_candidates:
-            # A. 60日最大回撤 < 15%
-            if not check_drawdown(ContextInfo, code):
-                #print(f"剔除 {code}: 最大回撤超标")
-                continue
-                
-            # B. Level-2 逻辑 (封单、撤单、炸板)
-            if not check_level2_metrics(ContextInfo, code):
-                #print(f"剔除 {code}: Level-2指标不满足")
-                continue
-                
-            # C. 龙虎榜逻辑 (卖方机构 <= 1)
-            if not check_lhb_metrics(ContextInfo, code):
-                print(f"剔除 {code}: 龙虎榜指标不满足")
-                continue
-                
+            if not check_drawdown(ContextInfo, code): continue
+            # if not check_level2_metrics(ContextInfo, code): continue # 需要L2数据
+            # if not check_lhb_metrics(ContextInfo, code): continue
+            
             final_list.append(code)
             
-        ContextInfo.buy_candidates = final_list
-        print(f"步骤3完成: 最终选股结果 {len(final_list)} 只 -> {final_list}")
-        print("<<< 选股流程结束")
+        return final_list
+        
     except Exception as e:
-        print(f"选股流程异常: {e}")
+        print(f"选股核心逻辑出错: {e}")
+        return []
+
+# ==========================================
+# 辅助函数
+# ==========================================
 
 def filter_basic_criteria(ContextInfo):
     """剔除 ST、北交所、创业板、科创板、次新股、高价股"""
@@ -329,20 +483,11 @@ def is_limit_up_bar(code, bar):
         # print(f"is_limit_up_bar error {code}: {e}")
         return False
 
-def check_drawdown(ContextInfo, code):
-    """涨停前 60 日最大回撤＜15%"""
+def check_drawdown_from_data(ContextInfo, code, df):
+    """(纯计算) 涨停前 60 日最大回撤＜15%"""
     try:
-        # 获取过去63天数据 (多取一点)
-        df = ContextInfo.get_market_data_ex(
-            ['high', 'low'], 
-            [code], 
-            period='1d', 
-            count=63, 
-            subscribe=False
-        ).get(code)
-        
         if df is None or len(df) < 60:
-            return False # 数据不足，可能是次新股，剔除
+            return False 
             
         # 取涨停前的数据 (剔除最近1天)
         hist_df = df.iloc[:-1]
@@ -365,6 +510,23 @@ def check_drawdown(ContextInfo, code):
         if is_pass:
             print(f"剔除 {code}: 60日最大回撤 {max_drawdown:.2%}，高于 {ContextInfo.params['drawdown_limit']:.2%}")
         return not is_pass
+    except Exception as e:
+        print(f"回撤计算异常 {code}: {e}")
+        return False
+
+def check_drawdown(ContextInfo, code):
+    """(旧接口) 涨停前 60 日最大回撤＜15%"""
+    try:
+        # 获取过去63天数据 (多取一点)
+        df = ContextInfo.get_market_data_ex(
+            ['high', 'low'], 
+            [code], 
+            period='1d', 
+            count=63, 
+            subscribe=False
+        ).get(code)
+        
+        return check_drawdown_from_data(ContextInfo, code, df)
     except Exception as e:
         print(f"回撤计算异常 {code}: {e}")
         return False
