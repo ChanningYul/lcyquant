@@ -52,6 +52,7 @@ class StockSelector:
     def __init__(self):
         self.stock_list = []
         self.use_mock_data = False  # 标记是否使用模拟数据
+        self.trading_calendar = []  # 交易日历
         self.params = {
             'limit_ratio_main': 0.10,  # 沪深A股涨停幅度
             'limit_ratio_special': 0.20,  # 创业板涨停幅度
@@ -65,7 +66,7 @@ class StockSelector:
         }
 
     def init_data(self):
-        """初始化数据：获取股票列表"""
+        """初始化数据：获取股票列表和交易日历"""
         logger.info("开始初始化数据...")
         try:
             # 使用xtQuant接口获取股票列表
@@ -74,6 +75,21 @@ class StockSelector:
             self.stock_list = xtdata.get_stock_list_in_sector('沪深A股')
 
             logger.info(f"获取到 {len(self.stock_list)} 只股票")
+
+            # 获取交易日历
+            try:
+                # 获取上海和深圳的交易日历
+                calendar_sh = xtdata.get_trading_calendar('SH')
+                calendar_sz = xtdata.get_trading_calendar('SZ')
+                # 合并并去重
+                self.trading_calendar = sorted(set(calendar_sh + calendar_sz))
+                if self.trading_calendar:
+                    logger.info(f"获取到 {len(self.trading_calendar)} 个交易日")
+                else:
+                    logger.warning("交易日历为空")
+            except Exception as e:
+                logger.warning(f"获取交易日历失败: {e}")
+
             return True
         except Exception as e:
             logger.error(f"初始化数据失败: {e}")
@@ -140,15 +156,148 @@ class StockSelector:
     def get_stock_name(self, code: str) -> str:
         """获取股票名称（模拟数据）"""
         return f"股票{code}"
+
+    def is_before_trading_time(self) -> bool:
+        """
+        判断当前是否在15:00之前（交易时间前）
+        True: 交易前，需要使用前3个交易日数据判断涨停
+        False: 交易后或收盘后，使用前2个交易日+当日数据判断涨停
+        """
+        now = datetime.datetime.now()
+        cutoff_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        return now < cutoff_time
+
+    def get_trading_dates(self, count: int) -> List[str]:
+        """
+        根据当前时间获取需要的交易日
+        交易前：返回前N个完整交易日
+        交易后：返回前N-1个完整交易日 + 当日
+        """
+        if self.use_mock_data:
+            # 模拟数据模式下，返回模拟日期
+            return []
+
+        # 如果有交易日历，使用交易日历
+        if self.trading_calendar:
+            recent_dates = sorted(self.trading_calendar, reverse=True)
+            if self.is_before_trading_time():
+                return recent_dates[:count]
+            else:
+                return recent_dates[:count]
+        else:
+            # 无法获取交易日历时，使用get_market_last_trade_date
+            try:
+                from xtquant import xtdata
+                import datetime
+                # 获取最后交易日
+                last_date_sh = xtdata.get_market_last_trade_date('SH')
+                last_date_sz = xtdata.get_market_last_trade_date('SZ')
+                # 使用较新的日期作为基准
+                last_date_ts = max(last_date_sh, last_date_sz)
+                # 转换时间戳为datetime对象
+                last_date_dt = datetime.datetime.fromtimestamp(last_date_ts / 1000)
+                # 生成连续的交易日期（倒推count天）
+                trading_dates = []
+                current_date = last_date_dt
+                for i in range(count):
+                    trading_dates.append(current_date.strftime('%Y%m%d'))
+                    # 倒推一天
+                    current_date = current_date - datetime.timedelta(days=1)
+                return trading_dates
+            except Exception as e:
+                logger.warning(f"无法获取交易日历和最后交易日: {e}")
+                return []
+
+    def get_market_data_ex_with_trading_dates(self, fields: List[str], stock_list: List[str],
+                                              period: str, count: int) -> Dict:
+        """
+        根据交易日历获取市场数据（使用交易日期而非自然日期）
+        """
+        if self.use_mock_data:
+            return self.get_market_data_mock(fields, stock_list, period, count)
+
+        # QMT极简版不支持start_time和end_time参数，使用count参数
+        # 周六周日市场关闭，需要更多历史数据才能获取到交易日数据
+        # 非交易日需要更大的count值以确保获取到最近交易日的数据
+        logger.info("使用count参数获取历史数据（非交易日需增加数据量）")
+
+        # 计算调整后的count值
+        # 周一需要5天（上周五+周末3天）
+        # 周二-周五需要3天
+        # 周六-周日需要4天
+        now = datetime.datetime.now()
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+        if weekday == 0:  # 周一
+            adjusted_count = count * 5  # 需要获取上周五及更早的数据
+        elif weekday == 5 or weekday == 6:  # 周六或周日
+            adjusted_count = count * 4  # 需要获取周五及更早的数据
+        else:  # 周二至周五
+            adjusted_count = count * 3  # 工作日正常获取
+
+        logger.info(f"当前星期: {now.strftime('%A')}, 调整count: {count} -> {adjusted_count}")
+
+        result = {}
+        try:
+            from xtquant import xtdata
+
+            # 尝试使用fill_data=True来填充周末的数据
+            logger.info("尝试使用fill_data=True获取数据...")
+
+            for code in stock_list:
+                try:
+                    # xtdata.get_market_data_ex() 返回字典格式数据
+                    data = xtdata.get_market_data_ex(
+                        field_list=fields,
+                        stock_list=[code],
+                        period=period,
+                        count=adjusted_count,
+                        dividend_type='none',  # 不复权
+                        fill_data=True,  # 填充数据
+                    )
+
+                    if data and code in data:
+                        # 转换为DataFrame
+                        result[code] = data[code]
+
+                except Exception as e:
+                    logger.warning(f"获取 {code} 历史数据失败: {e}")
+                    continue
+
+            logger.info(f"成功获取 {len(result)}/{len(stock_list)} 只股票的历史数据")
+
+            # 检查数据质量
+            if len(result) > 0:
+                # 检查是否有非空数据
+                stocks_with_data = sum(1 for df in result.values() if len(df) > 0)
+                logger.info(f"其中有数据的股票: {stocks_with_data}/{len(result)}")
+
+                # 如果所有数据都是空的，提示用户
+                if stocks_with_data == 0:
+                    now = datetime.datetime.now()
+                    if now.weekday() >= 5:  # 周六(5)或周日(6)
+                        logger.warning("=" * 60)
+                        logger.warning("当前是周末，QMT极简版无法获取历史数据")
+                        logger.warning("建议：")
+                        logger.warning("1. 在工作日运行脚本（周一至周五 9:30-15:00）")
+                        logger.warning("2. 或使用模拟数据模式进行测试")
+                        logger.warning("=" * 60)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"获取市场数据失败: {e}")
+            return {}
     def get_current_price(self, code: str) -> float:
         """获取当前价格"""
         # 返回模拟价格
         import random
         return round(random.uniform(5, 100), 2)
 
-    def is_limit_up_bar(self, code: str, bar: Dict) -> bool:
+    def is_limit_up_bar(self, code: str, bar: Dict, is_today: bool = False) -> bool:
         """
         判断某根K线是否涨停
+        is_today: 是否为当日数据（当日数据可能不完整，需要放宽条件）
         """
         try:
             close = bar.get('close', 0)
@@ -159,8 +308,14 @@ class StockSelector:
                 return False
 
             # 1. 基础检查：收盘价必须等于最高价 (未炸板)
-            if abs(close - high) > 0.01:
-                return False
+            # 当日数据还未收盘，可能炸板，所以放宽条件
+            if not is_today:
+                if abs(close - high) > 0.01:
+                    return False
+            else:
+                # 当日数据：只要涨幅达到涨停价即可，不要求收盘=最高
+                # 但还是要有一定约束
+                pass
 
             # 2. 确定涨停幅度
             limit_ratio = 0.10  # 默认主板 10%
@@ -172,8 +327,8 @@ class StockSelector:
             # 3. 计算涨幅
             pct = (close - pre_close) / pre_close
 
-            # 4. 容差判断
-            threshold = limit_ratio - 0.015
+            # 4. 容差判断（当日数据容差更大）
+            threshold = limit_ratio - 0.02 if is_today else limit_ratio - 0.015
             if pct < threshold:
                 return False
 
@@ -239,43 +394,95 @@ class StockSelector:
 
             log_selection(f"=== 开始新一轮选股筛选 (候选 {len(basic_pool)} 只) ===")
 
-            # 2. 批量获取3日数据用于涨停判断
-            logger.info("获取3日行情数据...")
-            data_3d = self.get_market_data_ex(
+            # 2. 批量获取N日数据用于涨停判断（根据当前时间动态调整）
+            is_before_trading = self.is_before_trading_time()
+            logger.info(f"当前时间: {datetime.datetime.now().strftime('%H:%M:%S')}")
+            logger.info(f"交易前模式: {is_before_trading}")
+
+            # 动态调整count值
+            if is_before_trading:
+                # 交易前：需要前3个完整交易日 + 1个前前交易日作为对比 = 4个交易日
+                data_count = 4
+                logger.info("交易前模式: 筛选上交易日首板（需要4个交易日数据）")
+            else:
+                # 交易后：需要前2个完整交易日 + 当日 = 3个交易日
+                data_count = 3
+                logger.info("交易后模式: 筛选当日首板（需要3个交易日数据）")
+
+            logger.info(f"获取{data_count}日行情数据...")
+            data_3d = self.get_market_data_ex_with_trading_dates(
                 fields=['close', 'preClose', 'high', 'amount', 'open'],
                 stock_list=basic_pool,
                 period='1d',
-                count=3
+                count=data_count
             )
 
             # 3. 初筛涨停股
             logger.info("筛选涨停股...")
             limit_up_candidates = []
+            total_stocks = 0
+            stocks_with_data = 0
+
             for code in basic_pool:
+                total_stocks += 1
                 if code not in data_3d:
                     continue
 
                 df = data_3d[code]
-                if len(df) < 3:
+                # 交易前需要至少4条数据（-3, -2索引），交易后需要至少3条数据（-2索引）
+                min_required = 4 if is_before_trading else 3
+                if len(df) < min_required:
                     continue
 
-                bar_t = df.iloc[-1]
-                bar_prev = df.iloc[-2]
+                stocks_with_data += 1
 
-                if self.is_limit_up_bar(code, bar_t) and not self.is_limit_up_bar(code, bar_prev):
-                    limit_up_candidates.append(code)
+                if is_before_trading:
+                    # 交易前（早于15:00）：筛选上一个交易日（bar_prev）的首板
+                    # bar_prev 涨停 AND bar_prev_prev 未涨停
+                    bar_target = df.iloc[-2]  # 上一个交易日
+                    bar_prev_target = df.iloc[-3]  # 上上一个交易日
+                    is_today_bar = False
 
-            logger.info(f"初筛涨停股数量: {len(limit_up_candidates)}")
+                    if self.is_limit_up_bar(code, bar_target, is_today_bar) and \
+                       not self.is_limit_up_bar(code, bar_prev_target, False):
+                        limit_up_candidates.append(code)
+                        log_selection(f"[交易前] 上交易日首板: {code}")
+                else:
+                    # 交易后（晚于15:00）：筛选当日（bar_t）的首板
+                    # bar_t 涨停 AND bar_prev 未涨停
+                    bar_target = df.iloc[-1]  # 当日
+                    bar_prev_target = df.iloc[-2]  # 昨日
+                    is_today_bar = True
+
+                    if self.is_limit_up_bar(code, bar_target, is_today_bar) and \
+                       not self.is_limit_up_bar(code, bar_prev_target, False):
+                        limit_up_candidates.append(code)
+                        log_selection(f"[交易后] 当日首板: {code}")
+
+            logger.info(f"统计: 总股票数={total_stocks}, 有数据股票数={stocks_with_data}")
+
+            if is_before_trading:
+                logger.info(f"上交易日首板筛选结果: {len(limit_up_candidates)} 只")
+            else:
+                logger.info(f"当日首板筛选结果: {len(limit_up_candidates)} 只")
+
+            if limit_up_candidates:
+                logger.info(f"涨停股列表: {limit_up_candidates[:10]}")
+            else:
+                logger.info("未发现符合条件的涨停股票")
 
             if not limit_up_candidates:
-                logger.info("今日无涨停候选股")
+                if is_before_trading:
+                    logger.info("上交易日无涨停候选股")
+                else:
+                    logger.info("当日无涨停候选股")
                 # 写入空结果
                 self._save_result([])
                 return []
 
-            # 4. 获取候选股的60日数据用于回撤计算
+            # 4. 获取候选股的60日数据用于回撤计算（使用交易日历）
             logger.info("获取60日行情数据...")
-            data_60d = self.get_market_data_ex(
+            data_60d = self.get_market_data_ex_with_trading_dates(
                 fields=['high', 'low'],
                 stock_list=limit_up_candidates,
                 period='1d',
