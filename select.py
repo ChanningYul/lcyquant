@@ -237,32 +237,15 @@ class StockSelector:
             return self.get_market_data_mock(fields, stock_list, period, count)
 
         # QMT极简版不支持start_time和end_time参数，使用count参数
-        # 周六周日市场关闭，需要更多历史数据才能获取到交易日数据
-        # 非交易日需要更大的count值以确保获取到最近交易日的数据
-        logger.info("使用count参数获取历史数据（非交易日需增加数据量）")
-
-        # 计算调整后的count值
-        # 周一需要5天（上周五+周末3天）
-        # 周二-周五需要3天
-        # 周六-周日需要4天
-        now = datetime.datetime.now()
-        weekday = now.weekday()  # 0=Monday, 6=Sunday
-
-        if weekday == 0:  # 周一
-            adjusted_count = count * 5  # 需要获取上周五及更早的数据
-        elif weekday == 5 or weekday == 6:  # 周六或周日
-            adjusted_count = count * 4  # 需要获取周五及更早的数据
-        else:  # 周二至周五
-            adjusted_count = count * 3  # 工作日正常获取
-
-        logger.info(f"当前星期: {now.strftime('%A')}, 调整count: {count} -> {adjusted_count}")
+        # fill_data=False 直接获取实际交易日数据，不填充周末等非交易日
+        logger.info(f"使用count参数直接获取{count}条交易日数据")
 
         result = {}
         try:
             from xtquant import xtdata
 
-            # 尝试使用fill_data=True来填充周末的数据
-            logger.info(f"尝试使用fill_data=True获取数据...股票数量: {len(stock_list)}")
+            # 直接使用count参数获取实际交易日数据
+            logger.info(f"使用fill_data=False获取数据...股票数量: {len(stock_list)}, 需要的count: {count}")
 
             try:
                 # 批量获取所有股票数据
@@ -270,9 +253,9 @@ class StockSelector:
                     field_list=fields,
                     stock_list=stock_list,
                     period=period,
-                    count=adjusted_count,
+                    count=count,  # 直接使用传入的count值
                     dividend_type='none',  # 不复权
-                    fill_data=True,  # 填充数据
+                    fill_data=False,  # 不填充数据，直接获取实际交易日数据
                 )
 
                 """
@@ -445,6 +428,11 @@ class StockSelector:
         start_time = time.time()
 
         try:
+            # 判断当前是否在交易时间前（早于9:30）
+            now = datetime.datetime.now()
+            is_before_trading = now.hour < 9 or (now.hour == 9 and now.minute < 30)
+            logger.info(f"当前时间: {now.strftime('%H:%M:%S')}, 交易前模式: {is_before_trading}")
+
             # 1. 基础过滤
             basic_pool = self.filter_basic_criteria()
             if not basic_pool:
@@ -453,27 +441,14 @@ class StockSelector:
 
             log_selection(f"=== 开始新一轮选股筛选 (候选 {len(basic_pool)} 只) ===")
 
-            # 2. 批量获取N日数据用于涨停判断（根据当前时间动态调整）
-            is_before_trading = self.is_before_trading_time()
-            logger.info(f"当前时间: {datetime.datetime.now().strftime('%H:%M:%S')}")
-            logger.info(f"交易前模式: {is_before_trading}")
-
-            # 动态调整count值
-            if is_before_trading:
-                # 交易前（早于9:30）：需要前3个完整交易日 + 1个前前交易日作为对比 = 4个交易日
-                data_count = 4
-                logger.info("交易前模式: 筛选上交易日首板（需要4个交易日数据）")
-            else:
-                # 交易时间（9:30-15:00）或收盘后（>=15:00）：需要前2个完整交易日 + 当日 = 3个交易日
-                data_count = 3
-                logger.info("交易时间/收盘后模式: 筛选当日首板（需要3个交易日数据）")
-
-            logger.info(f"获取{data_count}日行情数据...")
+            # 2. 批量获取60日数据用于涨停判断（统一使用60个交易日数据）
+            # 使用fill_data=False直接获取实际交易日数据，避免填充周末等非交易日
+            logger.info(f"获取60个交易日行情数据用于涨停判断...")
             data_3d = self.get_market_data_ex_with_trading_dates(
                 fields=['close', 'preClose', 'high', 'amount', 'open'],
                 stock_list=basic_pool,
                 period='1d',
-                count=data_count
+                count=3  # 直接使用60个交易日数据
             )
             # 保存3日数据到CSV
             if data_3d:
@@ -499,15 +474,15 @@ class StockSelector:
                     continue
 
                 df = data_3d[code]
-                # 交易前需要至少4条数据（-3, -2索引），交易后需要至少3条数据（-2索引）
-                min_required = 4 if is_before_trading else 3
+                # 交易前需要至少3条数据（-3, -2索引），交易后需要至少2条数据（-2索引）
+                min_required = 3 if is_before_trading else 2
                 if len(df) < min_required:
                     continue
 
                 stocks_with_data += 1
 
                 if is_before_trading:
-                    # 交易前（早于15:00）：筛选上一个交易日（bar_prev）的首板
+                    # 交易前（早于9:30）：筛选上一个交易日（bar_prev）的首板
                     # bar_prev 涨停 AND bar_prev_prev 未涨停
                     bar_target = df.iloc[-2]  # 上一个交易日
                     bar_prev_target = df.iloc[-3]  # 上上一个交易日
@@ -518,7 +493,7 @@ class StockSelector:
                         limit_up_candidates.append(code)
                         log_selection(f"[交易前] 上交易日首板: {code}")
                 else:
-                    # 交易后（晚于15:00）：筛选当日（bar_t）的首板
+                    # 交易时间或收盘后（9:30-24:00）：筛选当日（bar_t）的首板
                     # bar_t 涨停 AND bar_prev 未涨停
                     bar_target = df.iloc[-1]  # 当日
                     bar_prev_target = df.iloc[-2]  # 昨日
@@ -538,6 +513,8 @@ class StockSelector:
 
             if limit_up_candidates:
                 logger.info(f"涨停股列表: {limit_up_candidates[:10]}")
+                # 保存首板股票到firstlimit.csv
+                self._save_first_limit_stocks(limit_up_candidates)
             else:
                 logger.info("未发现符合条件的涨停股票")
 
@@ -551,12 +528,12 @@ class StockSelector:
                 return []
 
             # 4. 获取候选股的60日数据用于回撤计算（使用交易日历）
-            logger.info("获取60日行情数据...")
+            logger.info("获取60个交易日行情数据...")
             data_60d = self.get_market_data_ex_with_trading_dates(
                 fields=['high', 'low'],
                 stock_list=limit_up_candidates,
                 period='1d',
-                count=63
+                count=60  # 直接使用60个交易日数据
             )
             # 保存60日数据到CSV
             if data_60d:
@@ -570,27 +547,23 @@ class StockSelector:
                     pd.concat(all_rows, ignore_index=True).to_csv('data_60d.csv', index=False)
                     logger.info(f"60日数据已保存至 data_60d.csv")
             
-            # 5. 回撤检查（暂时跳过，确保选出股票）
+            # 5. 回撤检查
             logger.info("回撤检查")
-            final_list = limit_up_candidates.copy()
+            final_list = []
             rejected_count = 0
 
-            # TODO: 根据需要启用回撤检查
             for code in limit_up_candidates:
                 if code not in data_60d:
                     rejected_count += 1
+                    logger.info(f"{code} 回撤检查剔除: 无60日数据")
                     continue
-            
+
                 df = data_60d[code]
                 if not self.check_drawdown_from_data(code, df, self.params['drawdown_limit']):
                     rejected_count += 1
                     continue
-            
-                final_list.append(code)
-                log_selection(f"入选: {code}")
 
-            for code in final_list:
-                log_selection(f"入选: {code}")
+                final_list.append(code)
 
             # 6. 可选：高级筛选（L2数据、龙虎榜等）
             # final_list = self._apply_advanced_filters(final_list)
@@ -630,6 +603,31 @@ class StockSelector:
 
         except Exception as e:
             logger.error(f"保存结果失败: {e}")
+
+    def _save_first_limit_stocks(self, stock_codes: List[str]):
+        """保存首板股票到firstlimit.csv文件"""
+        try:
+            import csv
+            csv_file = "firstlimit.csv"
+
+            # 获取股票名称
+            stocks_data = []
+            for code in stock_codes:
+                name = self.get_stock_name(code)
+                stocks_data.append([code, name])
+
+            # 保存到CSV文件
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # 写入表头
+                writer.writerow(['股票代码', '股票名称'])
+                # 写入数据
+                writer.writerows(stocks_data)
+
+            logger.info(f"首板股票已保存至 {csv_file}，共 {len(stock_codes)} 只")
+
+        except Exception as e:
+            logger.error(f"保存首板股票失败: {e}")
 
     # 以下是需要根据miniQMT实际API实现的方法
     def get_market_data_ex(self, fields: List[str], stock_list: List[str], period: str, count: int) -> Dict:

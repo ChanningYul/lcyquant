@@ -28,7 +28,8 @@ PARAMS = {
     'min_price': 1.0,  # 最小价格（防止低价股）
 
     # 回撤控制
-    'drawdown_limit': 0.20,  # 最大回撤率（20%）
+    'drawdown_limit': 0.25,  # 最大回撤率（25%）
+    'enable_drawdown_check': False,  # 是否启用回撤检查
 
     # 交易参数
     'stop_profit': 0.10,  # 止盈比例

@@ -29,13 +29,13 @@ from xtquant import xtdata
 
 # 配置日志
 def setup_logging(log_file: str = "download_all_stocks.log"):
-    """配置日志"""
+    """配置日志（输出到stderr，避免干扰进度条）"""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler()
+            logging.StreamHandler(sys.stderr)  # 输出到stderr
         ]
     )
     return logging.getLogger(__name__)
@@ -47,10 +47,16 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python download_all_stocks.py                          # 下载近70个交易日数据
+  python download_all_stocks.py                          # 下载近70个交易日数据（启用智能增量）
   python download_all_stocks.py --start 20240101 --end 20241231  # 指定日期范围
   python download_all_stocks.py --days 30               # 下载近30个交易日数据
   python download_all_stocks.py --resume                # 断点续传（从上次中断的地方继续）
+  python download_all_stocks.py --no-smart-increment    # 禁用智能增量，每次完整下载
+
+智能增量更新说明：
+  - 默认启用智能增量更新，会自动检测本地数据，只下载缺失的部分
+  - 第一次运行时下载完整历史数据
+  - 后续运行只下载新产生的数据，大大节省时间
         """
     )
 
@@ -63,6 +69,10 @@ def parse_arguments():
     parser.add_argument('--delay', type=float, default=0.1, help='下载间隔秒数（默认0.1秒）')
     parser.add_argument('--batch-size', type=int, default=50, help='每批次下载股票数量（默认50）')
     parser.add_argument('--log-file', type=str, default='download_all_stocks.log', help='日志文件名')
+    parser.add_argument('--smart-increment', action='store_true', default=True,
+                        help='启用智能增量更新（自动检测本地数据，仅下载缺失部分，默认启用）')
+    parser.add_argument('--no-smart-increment', action='store_false', dest='smart_increment',
+                        help='禁用智能增量更新，每次都完整下载')
 
     return parser.parse_args()
 
@@ -167,11 +177,83 @@ def save_downloaded_stocks(downloaded_stocks: set, resume_file: str):
     except Exception as e:
         print(f"保存断点续传文件失败: {e}")
 
-def download_stock_data(symbol: str, start_date: str, end_date: str, period: str, retry: int, logger) -> bool:
-    """下载单只股票数据"""
+def get_latest_data_date(symbol: str, period: str, logger) -> Optional[str]:
+    """获取本地数据的最新日期"""
+    try:
+        # 获取最近的数据（获取close字段，因为time字段可能不是所有周期都有）
+        # 对于1d周期，close字段一定有数据
+        fields = ['close'] if period == '1d' else ['time', 'close']
+        data = xtdata.get_market_data(
+            field_list=fields,
+            stock_list=[symbol],
+            period=period,
+            count=1  # 只获取最新1条记录
+        )
+
+        # xtdata.get_market_data 返回格式是 {field: DataFrame}
+        # DataFrame 的 index 是 stock_list，columns 是 time_list
+        if 'close' in data:
+            df = data['close']
+            if symbol in df.index and len(df.columns) > 0:
+                # 获取该股票的数据
+                stock_data = df.loc[symbol]
+                # 获取最新的时间列
+                latest_timestamp = stock_data.index[-1]  # 最新的时间戳
+                # 转换为日期字符串格式 (YYYYMMDD)
+                latest_date = datetime.fromtimestamp(latest_timestamp / 1000).strftime('%Y%m%d')
+                logger.debug(f"{symbol} 本地最新数据日期: {latest_date}")
+                return latest_date
+        return None
+    except Exception as e:
+        logger.debug(f"获取 {symbol} 本地数据日期失败: {str(e)[:80]}")
+        return None
+
+def download_stock_data_no_increment(symbol: str, start_date: str, end_date: str, period: str, retry: int, logger) -> bool:
+    """下载单只股票数据（传统方式，不使用增量下载）"""
     for attempt in range(retry):
         try:
-            xtdata.download_history_data(symbol, period, start_date, end_date)
+            xtdata.download_history_data(symbol, period, start_time=start_date, end_time=end_date)
+            return True
+        except Exception as e:
+            if attempt < retry - 1:
+                time.sleep(1)  # 等待1秒后重试
+                logger.debug(f"{symbol} 下载失败，重试 {attempt + 1}/{retry}: {str(e)[:80]}")
+            else:
+                logger.warning(f"{symbol} 下载最终失败: {str(e)[:80]}")
+    return False
+
+def download_stock_data(symbol: str, start_date: str, end_date: str, period: str, retry: int, logger) -> str:
+    """
+    下载单只股票数据（智能增量更新）
+    返回值：
+      - 'skipped': 数据已是最新，跳过下载
+      - True: 下载成功
+      - False: 下载失败
+    """
+    for attempt in range(retry):
+        try:
+            # 检查本地是否已有数据
+            latest_date = get_latest_data_date(symbol, period, logger)
+
+            if latest_date:
+                # 本地已有数据，计算需要增量下载的起始日期
+                latest_date_obj = datetime.strptime(latest_date, '%Y%m%d')
+                next_day = latest_date_obj + timedelta(days=1)
+                start_time = next_day.strftime('%Y%m%d')
+
+                # 检查是否需要下载（如果最新日期已经晚于等于目标日期，则跳过）
+                target_date_obj = datetime.strptime(end_date, '%Y%m%d')
+
+                if start_time > end_date:
+                    # 数据已是最新，跳过下载
+                    return 'skipped'
+                else:
+                    # 增量下载
+                    xtdata.download_history_data(symbol, period, start_time=start_time, end_time=end_date)
+            else:
+                # 本地无数据，完整下载
+                xtdata.download_history_data(symbol, period, start_time=start_date, end_time=end_date)
+
             return True
         except Exception as e:
             if attempt < retry - 1:
@@ -193,7 +275,8 @@ def check_connection(logger) -> bool:
 
 def reconnect_qmt(logger) -> bool:
     """重新连接QMT"""
-    logger.info("尝试重新连接QMT...")
+    # 直接使用print输出到stderr，避免使用logger干扰进度条
+    print("尝试重新连接QMT...", file=sys.stderr, flush=True)
     try:
         xtdata.disconnect()
     except:
@@ -202,68 +285,93 @@ def reconnect_qmt(logger) -> bool:
     time.sleep(2)
     return connect_qmt(logger)
 
-def download_batch_stocks(stocks: List[Tuple[str, str]], start_date: str, end_date: str,
-                         period: str, retry: int, delay: float, batch_size: int,
-                         downloaded_stocks: set, resume_file: str, logger):
-    """批量下载股票数据"""
+def download_all_stocks_process(stocks: List[Tuple[str, str]], start_date: str, end_date: str,
+                               period: str, retry: int, delay: float,
+                               downloaded_stocks: set, resume_file: str, smart_increment: bool, logger):
+    """下载所有股票数据（无批次处理）"""
 
-    # 创建进度条
-    pbar = tqdm(total=len(stocks), desc="下载进度", unit="只股票")
+    # 创建进度条（输出到stderr，确保在同一行刷新）
+    pbar = tqdm(total=len(stocks), desc="下载进度", unit="只股票",
+                file=sys.stderr, ncols=100, dynamic_ncols=True)
 
     success_count = 0
     fail_count = 0
-    connection_error_count = 0
+    skip_count = 0
+    already_count = 0  # 新增：已有数据且无需更新的数量
 
-    for i in range(0, len(stocks), batch_size):
-        batch = stocks[i:i + batch_size]
-        batch_num = i // batch_size + 1
-        total_batches = (len(stocks) + batch_size - 1) // batch_size
+    for symbol, name in stocks:
+        # 跳过已下载的股票（断点续传）
+        if symbol in downloaded_stocks:
+            already_count += 1
+            pbar.set_postfix({
+                '成功': success_count,
+                '失败': fail_count,
+                '跳过': skip_count,
+                '已有': already_count
+            })
+            pbar.update(1)
+            continue
 
-        logger.info(f"\n处理批次 {batch_num}/{total_batches}，共 {len(batch)} 只股票")
+        # 检查连接状态（静默处理，不输出到stdout）
+        if not check_connection(logger):
+            # 输出到stderr
+            print("QMT连接断开，尝试重连...", file=sys.stderr, flush=True)
+            if reconnect_qmt(logger):
+                print("重连成功", file=sys.stderr, flush=True)
+            else:
+                print("重连失败，保存进度并退出", file=sys.stderr, flush=True)
+                save_downloaded_stocks(downloaded_stocks, resume_file)
+                return
 
-        for symbol, name in batch:
-            # 跳过已下载的股票（断点续传）
-            if symbol in downloaded_stocks:
-                pbar.update(1)
-                continue
-
-            # 检查连接状态
-            if not check_connection(logger):
-                logger.error("QMT连接断开，尝试重连...")
-                if reconnect_qmt(logger):
-                    logger.info("重连成功")
-                else:
-                    logger.error("重连失败，保存进度并退出")
-                    save_downloaded_stocks(downloaded_stocks, resume_file)
-                    return
-
-            # 下载数据
-            if download_stock_data(symbol, start_date, end_date, period, retry, logger):
+        # 下载数据
+        if smart_increment:
+            # 使用智能增量下载
+            result = download_stock_data(symbol, start_date, end_date, period, retry, logger)
+            if result == 'skipped':
+                # 数据已是最新，跳过下载
+                skip_count += 1
+                # 将其添加到 downloaded_stocks，避免重复检测
+                downloaded_stocks.add(symbol)
+            elif result:
+                downloaded_stocks.add(symbol)
+                success_count += 1
+            else:
+                fail_count += 1
+        else:
+            # 使用传统方式（完整下载）
+            if download_stock_data_no_increment(symbol, start_date, end_date, period, retry, logger):
                 downloaded_stocks.add(symbol)
                 success_count += 1
             else:
                 fail_count += 1
 
-            pbar.update(1)
+        # 更新进度条并显示当前状态
+        pbar.set_postfix({
+            '成功': success_count,
+            '失败': fail_count,
+            '跳过': skip_count,
+            '已有': already_count
+        })
+        pbar.update(1)
 
-            # 延迟
-            time.sleep(delay)
+        # 延迟
+        time.sleep(delay)
 
-        # 每批次结束后保存进度
-        save_downloaded_stocks(downloaded_stocks, resume_file)
-        logger.info(f"批次 {batch_num} 完成：成功 {success_count}, 失败 {fail_count}")
+        # 每处理一定数量后保存进度
+        if (success_count + fail_count + skip_count) % 100 == 0:
+            save_downloaded_stocks(downloaded_stocks, resume_file)
 
     pbar.close()
 
-    # 显示最终结果
-    logger.info("\n" + "="*60)
-    logger.info("下载完成！")
-    logger.info(f"总股票数: {len(stocks)}")
-    logger.info(f"成功下载: {success_count}")
-    logger.info(f"下载失败: {fail_count}")
-    logger.info(f"已跳过: {len(downloaded_stocks) - success_count}")
-    logger.info(f"连接错误次数: {connection_error_count}")
-    logger.info("="*60)
+    # 显示最终结果（输出到stderr）
+    print("\n" + "="*80, file=sys.stderr)
+    print("下载完成！", file=sys.stderr)
+    print(f"总股票数: {len(stocks)}", file=sys.stderr)
+    print(f"成功下载: {success_count}", file=sys.stderr)
+    print(f"下载失败: {fail_count}", file=sys.stderr)
+    print(f"跳过下载: {skip_count}", file=sys.stderr)
+    print(f"已有数据: {already_count}", file=sys.stderr)
+    print("="*80, file=sys.stderr)
 
 def main():
     """主函数"""
@@ -297,15 +405,12 @@ def main():
         logger.info(f"数据周期: {args.period}")
         logger.info(f"重试次数: {args.retry}")
         logger.info(f"下载间隔: {args.delay}秒")
-        logger.info(f"批次大小: {args.batch_size}")
+        logger.info(f"智能增量更新: {'启用' if args.smart_increment else '禁用'}")
 
-        # 加载断点续传数据
+        # 加载已下载股票列表（总是加载，支持智能增量）
         resume_file = "downloaded_stocks.json"
-        if args.resume:
-            downloaded_stocks = load_downloaded_stocks(resume_file, logger)
-        else:
-            downloaded_stocks = set()
-            logger.info("全新下载模式")
+        downloaded_stocks = load_downloaded_stocks(resume_file, logger)
+        logger.info(f"已加载已下载股票列表: {len(downloaded_stocks)} 只")
 
         # 获取股票列表
         stocks = get_all_a_stocks(logger)
@@ -313,19 +418,17 @@ def main():
             logger.error("未能获取股票列表，退出")
             return
 
-        # 过滤已下载的股票
-        remaining_stocks = [(s, n) for s, n in stocks if s not in downloaded_stocks]
-        logger.info(f"待下载股票数量: {len(remaining_stocks)}")
+        logger.info(f"总股票数量: {len(stocks)}")
 
-        if len(remaining_stocks) == 0:
-            logger.info("所有股票已下载完成！")
+        if len(stocks) == 0:
+            logger.info("没有股票需要处理！")
             return
 
-        # 开始下载
-        download_batch_stocks(
-            remaining_stocks, start_date, end_date, args.period,
-            args.retry, args.delay, args.batch_size,
-            downloaded_stocks, resume_file, logger
+        # 开始下载（不再分批次）
+        download_all_stocks_process(
+            stocks, start_date, end_date, args.period,
+            args.retry, args.delay,
+            downloaded_stocks, resume_file, args.smart_increment, logger
         )
 
     except KeyboardInterrupt:
