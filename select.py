@@ -21,6 +21,9 @@ xtquant_path = Path(__file__).parent / "xtquant"
 if xtquant_path.exists():
     sys.path.insert(0, str(xtquant_path))
 
+# 导入工具函数
+from util.functools import is_trading_day
+
 # 创建输出目录
 log_dir = Path("log")
 temp_dir = Path("temp")
@@ -142,13 +145,42 @@ class StockSelector:
 
     def filter_basic_criteria(self) -> List[str]:
         """
-        基础过滤：剔除ST、北交所、创业板、科创板、次新股、高价股
+        基础过滤：剔除ST、北交所、创业板、科创板、次新股、高价股、停牌股票
         """
         logger.info("开始基础过滤...")
+
+        # 批量获取停牌状态
+        suspended_stocks = set()
+        if not self.use_mock_data:
+            try:
+                from xtquant import xtdata
+                # 获取所有股票的最近1条日线数据的suspendFlag
+                # suspendFlag: 0-正常, 1-停牌
+                data = xtdata.get_market_data(
+                    field_list=['suspendFlag'],
+                    stock_list=self.stock_list,
+                    period='1d',
+                    count=1
+                )
+                if 'suspendFlag' in data:
+                    df = data['suspendFlag']
+                    if not df.empty:
+                        # 获取最后一列（最新日期）
+                        last_col = df.iloc[:, -1]
+                        # 找出值为1（停牌）的股票
+                        suspended_stocks = set(last_col[last_col == 1].index)
+                        logger.info(f"识别出 {len(suspended_stocks)} 只停牌股票")
+            except Exception as e:
+                logger.warning(f"获取停牌状态失败: {e}")
+
         valid_stocks = []
 
         for code in self.stock_list:
             try:
+                # 0. 剔除停牌
+                if code in suspended_stocks:
+                    continue
+
                 # 1. 剔除板块
                 if code.startswith('30') or code.startswith('68'):  # 创业板/科创板
                     continue
@@ -458,10 +490,18 @@ class StockSelector:
         start_time = time.time()
 
         try:
-            # 判断当前是否在交易时间前（早于9:30）
+            # 使用工具函数判断今天是否是交易日
+            today_is_trading_day = is_trading_day()
             now = datetime.datetime.now()
-            is_before_trading = now.hour < 9 or (now.hour == 9 and now.minute < 30)
-            logger.info(f"当前时间: {now.strftime('%H:%M:%S')}, 交易前模式: {is_before_trading}")
+
+            # 判断当前时间段：盘前(9:30前)、盘中(9:30-15:00)、盘后(15:00后)
+            is_before_trading_time = now.hour < 9 or (now.hour == 9 and now.minute < 30)
+            is_during_trading_time = 9 <= now.hour < 15
+            is_after_trading_time = now.hour >= 15
+
+            logger.info(f"当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"今天是交易日: {today_is_trading_day}")
+            logger.info(f"盘前时间: {is_before_trading_time}, 盘中时间: {is_during_trading_time}, 盘后时间: {is_after_trading_time}")
 
             # 1. 基础过滤
             basic_pool = self.filter_basic_criteria()
@@ -498,48 +538,40 @@ class StockSelector:
             total_stocks = 0
             stocks_with_data = 0
 
+            # 根据时间段确定筛选策略
             for code in basic_pool:
                 total_stocks += 1
                 if code not in data_3d:
                     continue
 
                 df = data_3d[code]
-                # 交易前需要至少3条数据（-3, -2索引），交易后需要至少2条数据（-2索引）
-                min_required = 3 if is_before_trading else 2
-                if len(df) < min_required:
-                    continue
-
                 stocks_with_data += 1
 
-                if is_before_trading:
-                    # 交易前（早于9:30）：筛选上一个交易日（bar_prev）的首板
-                    # bar_prev 涨停 AND bar_prev_prev 未涨停
-                    bar_target = df.iloc[-2]  # 上一个交易日
-                    bar_prev_target = df.iloc[-3]  # 上上一个交易日
+                # 进行首板筛选
+                if today_is_trading_day and is_during_trading_time or is_after_trading_time:
+                    is_today_bar = True
+                if len(df) >= 3:
+                    bar_target = df.iloc[-1]  # 上一个交易日
+                    bar_prev_target = df.iloc[-2]  # 上上一个交易日
                     is_today_bar = False
 
                     if self.is_limit_up_bar(code, bar_target, is_today_bar) and \
-                       not self.is_limit_up_bar(code, bar_prev_target, False):
+                        not self.is_limit_up_bar(code, bar_prev_target, False):
                         limit_up_candidates.append(code)
-                        log_selection(f"[交易前] 上交易日首板: {code}")
-                else:
-                    # 交易时间或收盘后（9:30-24:00）：筛选当日（bar_t）的首板
-                    # bar_t 涨停 AND bar_prev 未涨停
-                    bar_target = df.iloc[-1]  # 当日
-                    bar_prev_target = df.iloc[-2]  # 昨日
-                    is_today_bar = True
-
-                    if self.is_limit_up_bar(code, bar_target, is_today_bar) and \
-                       not self.is_limit_up_bar(code, bar_prev_target, False):
-                        limit_up_candidates.append(code)
-                        log_selection(f"[交易后] 当日首板: {code}")
+                        log_selection(f"首板: {code}")
 
             logger.info(f"统计: 总股票数={total_stocks}, 有数据股票数={stocks_with_data}")
 
-            if is_before_trading:
-                logger.info(f"上交易日首板筛选结果: {len(limit_up_candidates)} 只")
+            # 记录筛选结果
+            if today_is_trading_day:
+                if is_before_trading_time:
+                    logger.info(f"交易日-盘前：上交易日首板筛选结果: {len(limit_up_candidates)} 只")
+                elif is_during_trading_time:
+                    logger.info(f"交易日-盘中：当日首板筛选结果: {len(limit_up_candidates)} 只")
+                else:
+                    logger.info(f"交易日-盘后：当日首板筛选结果: {len(limit_up_candidates)} 只")
             else:
-                logger.info(f"当日首板筛选结果: {len(limit_up_candidates)} 只")
+                logger.info(f"非交易日：上个交易日首板筛选结果: {len(limit_up_candidates)} 只")
 
             if limit_up_candidates:
                 logger.info(f"涨停股列表: {limit_up_candidates[:10]}")
@@ -549,7 +581,7 @@ class StockSelector:
                 logger.info("未发现符合条件的涨停股票")
 
             if not limit_up_candidates:
-                if is_before_trading:
+                if is_before_trading_time:
                     logger.info("上交易日无涨停候选股")
                 else:
                     logger.info("当日无涨停候选股")
@@ -638,7 +670,9 @@ class StockSelector:
         """保存首板股票到firstlimit.csv文件（包含开盘价、收盘价和前一交易日收盘价）"""
         try:
             import csv
-            csv_file = temp_dir / "firstlimit.csv"
+            data_dir = Path("data")
+            data_dir.mkdir(exist_ok=True)
+            csv_file = data_dir / "firstlimit.csv"
 
             logger.info(f"获取首板股票的开盘价、收盘价和前一交易日收盘价...")
 
