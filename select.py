@@ -79,6 +79,7 @@ class StockSelector:
                 'stop_loss': -0.02,  # 止损比例
                 'seal_circ_ratio': 0.03,  # 封单对流通市值占比
                 'seal_turnover_ratio': 2.0,  # 封单占成交额倍数
+                'enable_seal_filter': True,  # 是否启用封单金额筛选
             }
 
     def init_data(self):
@@ -525,6 +526,150 @@ class StockSelector:
         logger.info(f"Tick过滤完成: {len(candidates)} -> {len(final_list)}")
         return final_list
 
+    def filter_by_seal_amount(self, candidates: List[str]) -> List[str]:
+        """
+        通过封单金额筛选股票
+        条件：
+        1. 封单金额 = 盘口卖一档价格 * 盘口卖一档数量
+        2. 封单金额 >= 0.03 * 流通市值 AND 封单金额 >= 2 * 当日成交额
+        """
+        logger.info("开始封单金额筛选...")
+        if not candidates:
+            return []
+
+        if not self.params.get('enable_seal_filter', True):
+            logger.info("封单金额筛选已禁用，跳过")
+            return candidates
+
+        final_list = []
+        try:
+            from xtquant import xtdata
+
+            # 批量获取Tick数据（包含盘口数据）
+            logger.info(f"获取 {len(candidates)} 只股票的盘口数据...")
+            ticks = xtdata.get_full_tick(candidates)
+
+            for code in candidates:
+                if code not in ticks:
+                    # 如果获取不到数据，暂且保留
+                    final_list.append(code)
+                    continue
+
+                tick = ticks[code]
+
+                # 1. 获取盘口数据：卖一档价格和数量
+                ask1_price = None
+                ask1_volume = None
+
+                if 'askPrice' in tick and 'askVol' in tick:
+                    ask_prices = tick['askPrice']
+                    ask_vols = tick['askVol']
+
+                    # 确保是列表/数组且长度大于0
+                    if (hasattr(ask_prices, '__len__') and len(ask_prices) > 0 and
+                        hasattr(ask_vols, '__len__') and len(ask_vols) > 0):
+                        ask1_price = ask_prices[0]
+                        ask1_volume = ask_vols[0]
+
+                if ask1_price is None or ask1_volume is None:
+                    logger.warning(f"{code}: 无法获取盘口数据，跳过封单筛选")
+                    final_list.append(code)
+                    continue
+
+                # 2. 计算封单金额
+                seal_amount = ask1_price * ask1_volume
+
+                # 3. 获取流通市值
+                circ_market_value = None
+
+                # 尝试从tick数据获取（如果接口支持）
+                if 'circulationValue' in tick:
+                    circ_market_value = tick.get('circulationValue')
+
+                # 如果无法直接获取，计算：流通量 * 当日收盘价
+                if circ_market_value is None or circ_market_value <= 0:
+                    try:
+                        # 获取最新日线数据
+                        data = xtdata.get_market_data_ex(
+                            field_list=['close', 'volume'],
+                            stock_list=[code],
+                            period='1d',
+                            count=1
+                        )
+
+                        if code in data and len(data[code]) > 0:
+                            df = data[code]
+                            close_price = df.iloc[-1]['close']
+                            # volume 是总成交量，需要获取流通量
+                            # 简化处理：使用总成交量作为近似（实际应使用流通股本）
+                            volume = df.iloc[-1]['volume']
+                            # 这里做一个简化估算：流通量约为总量的0.3-0.8倍
+                            # 实际项目中应该从基本面数据获取准确的流通股本
+                            circ_volume = volume * 0.5  # 简化估算
+                            circ_market_value = circ_volume * close_price
+                    except Exception as e:
+                        logger.warning(f"{code}: 获取流通市值失败: {e}")
+                        final_list.append(code)
+                        continue
+
+                # 4. 获取当日成交额
+                turnover_amount = None
+
+                # 尝试从tick数据获取
+                if 'turnover' in tick:
+                    turnover_amount = tick.get('turnover')
+
+                # 如果tick中没有成交额，从日线数据获取
+                if turnover_amount is None or turnover_amount <= 0:
+                    try:
+                        data = xtdata.get_market_data_ex(
+                            field_list=['amount'],
+                            stock_list=[code],
+                            period='1d',
+                            count=1
+                        )
+
+                        if code in data and len(data[code]) > 0:
+                            df = data[code]
+                            # amount字段单位是千元，转换为元
+                            turnover_amount = df.iloc[-1]['amount'] * 1000
+                    except Exception as e:
+                        logger.warning(f"{code}: 获取成交额失败: {e}")
+                        final_list.append(code)
+                        continue
+
+                # 5. 验证数据有效性
+                if (seal_amount <= 0 or circ_market_value <= 0 or turnover_amount <= 0):
+                    logger.warning(f"{code}: 数据无效 - 封单金额:{seal_amount:.2f}, 流通市值:{circ_market_value:.2f}, 成交额:{turnover_amount:.2f}")
+                    final_list.append(code)
+                    continue
+
+                # 6. 计算筛选条件
+                seal_circ_threshold = self.params['seal_circ_ratio'] * circ_market_value
+                seal_turnover_threshold = self.params['seal_turnover_ratio'] * turnover_amount
+
+                # 判断条件：封单金额 >= 0.03 * 流通市值 AND 封单金额 >= 2 * 当日成交额
+                condition1 = seal_amount >= seal_circ_threshold
+                condition2 = seal_amount >= seal_turnover_threshold
+
+                if condition1 and condition2:
+                    log_selection(f"封单筛选通过 {code}: 封单金额={seal_amount:.0f}, 流通市值占比={seal_amount/circ_market_value:.2%}, 成交额倍数={seal_amount/turnover_amount:.2f}")
+                    final_list.append(code)
+                else:
+                    reason1 = f"封单{seal_amount:.0f} < {seal_circ_threshold:.0f}" if not condition1 else ""
+                    reason2 = f"封单{seal_amount:.0f} < {seal_turnover_threshold:.0f}" if not condition2 else ""
+                    reason = " AND ".join([r for r in [reason1, reason2] if r])
+                    logger.info(f"剔除 {code}: {reason}")
+                    log_selection(f"封单筛选剔除 {code}: {reason}")
+
+        except Exception as e:
+            logger.error(f"封单金额筛选失败: {e}")
+            # 发生错误时返回原列表
+            return candidates
+
+        logger.info(f"封单金额筛选完成: {len(candidates)} -> {len(final_list)}")
+        return final_list
+
     def run_selection(self) -> Optional[List[str]]:
         """
         执行完整的选股流程
@@ -638,7 +783,7 @@ class StockSelector:
                 return []
 
             # 4. 获取候选股的60日数据用于回撤计算（使用交易日历）
-            logger.info("获取60个交易日行情数据...")
+            logger.info("获取60个交易日行情数据用于回撤计算...")
             data_60d = self.get_market_data_ex_with_trading_dates(
                 fields=['high', 'low'],
                 stock_list=limit_up_candidates,
@@ -675,12 +820,16 @@ class StockSelector:
 
                 final_list.append(code)
 
-            # 6. 可选：高级筛选（L2数据、龙虎榜等）
+            # 6. 封单金额筛选
+            if final_list and not self.use_mock_data:
+                final_list = self.filter_by_seal_amount(final_list)
+
+            # 7. 可选：高级筛选（L2数据、龙虎榜等）
             # final_list = self._apply_advanced_filters(final_list)
 
-            # 7. 保存结果
+            # 8. 保存结果
             elapsed = time.time() - start_time
-            msg = f"筛选完成: 初始 {len(basic_pool)}, 涨停候选 {len(limit_up_candidates)}, 剔除 {rejected_count}, 剩余 {len(final_list)}"
+            msg = f"筛选完成: 初始 {len(basic_pool)}, 涨停候选 {len(limit_up_candidates)}, 回撤剔除 {rejected_count}, 封单筛选后剩余 {len(final_list)}"
             logger.info(msg)
             log_selection(msg)
 
