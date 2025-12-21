@@ -21,20 +21,26 @@ xtquant_path = Path(__file__).parent / "xtquant"
 if xtquant_path.exists():
     sys.path.insert(0, str(xtquant_path))
 
+# 创建输出目录
+log_dir = Path("log")
+temp_dir = Path("temp")
+log_dir.mkdir(exist_ok=True)
+temp_dir.mkdir(exist_ok=True)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler('select.log', encoding='utf-8'),
+        logging.FileHandler(log_dir / 'select.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('StockSelector')
 
 # 配置文件路径
-CANDIDATE_FILE = "candidate.json"
-SELECT_LOG = "select_detail.log"
+CANDIDATE_FILE = temp_dir / "candidate.json"
+SELECT_LOG = log_dir / "select_detail.log"
 
 
 def log_selection(msg: str):
@@ -169,8 +175,32 @@ class StockSelector:
         return valid_stocks
 
     def get_stock_name(self, code: str) -> str:
-        """获取股票名称（模拟数据）"""
-        return f"股票{code}"
+        """获取股票名称"""
+        try:
+            # 如果使用模拟数据，返回模拟名称
+            if self.use_mock_data:
+                return f"股票{code}"
+
+            # 尝试通过xtdata获取真实股票名称
+            from xtquant import xtdata
+            try:
+                # 获取股票详细信息
+                info = xtdata.get_instrument_detail(code)
+                if info and 'InstrumentName' in info:
+                    return info['InstrumentName']
+                # 如果没有InstrumentName，尝试其他可能的字段
+                for key in ['name', 'shortName', 'abbr']:
+                    if key in info and info[key]:
+                        return info[key]
+            except Exception as e:
+                logger.debug(f"获取 {code} 股票名称失败: {e}")
+
+            # 如果获取失败，返回默认名称
+            return code
+
+        except Exception as e:
+            logger.warning(f"获取股票名称异常 {code}: {e}")
+            return code
 
     def is_before_trading_time(self) -> bool:
         """
@@ -443,12 +473,12 @@ class StockSelector:
 
             # 2. 批量获取60日数据用于涨停判断（统一使用60个交易日数据）
             # 使用fill_data=False直接获取实际交易日数据，避免填充周末等非交易日
-            logger.info(f"获取60个交易日行情数据用于涨停判断...")
+            logger.info(f"获取前3个交易日行情数据用于涨停判断...")
             data_3d = self.get_market_data_ex_with_trading_dates(
                 fields=['close', 'preClose', 'high', 'amount', 'open'],
                 stock_list=basic_pool,
                 period='1d',
-                count=3  # 直接使用60个交易日数据
+                count=3  # 使用3个交易日数据
             )
             # 保存3日数据到CSV
             if data_3d:
@@ -459,8 +489,8 @@ class StockSelector:
                         df_copy['code'] = code
                         all_rows.append(df_copy)
                 if all_rows:
-                    pd.concat(all_rows, ignore_index=True).to_csv('data_3d.csv', index=False)
-                    logger.info(f"3日数据已保存至 data_3d.csv")
+                    pd.concat(all_rows, ignore_index=True).to_csv(temp_dir / 'data_3d.csv', index=False)
+                    logger.info(f"3日数据已保存至 {temp_dir / 'data_3d.csv'}")
 
             # 3. 初筛涨停股
             logger.info("筛选涨停股...")
@@ -544,8 +574,8 @@ class StockSelector:
                         df_copy['code'] = code
                         all_rows.append(df_copy)
                 if all_rows:
-                    pd.concat(all_rows, ignore_index=True).to_csv('data_60d.csv', index=False)
-                    logger.info(f"60日数据已保存至 data_60d.csv")
+                    pd.concat(all_rows, ignore_index=True).to_csv(temp_dir / 'data_60d.csv', index=False)
+                    logger.info(f"60日数据已保存至 {temp_dir / 'data_60d.csv'}")
             
             # 5. 回撤检查
             logger.info("回撤检查")
@@ -595,7 +625,7 @@ class StockSelector:
                 "count": len(candidates)
             }
 
-            os.makedirs(os.path.dirname(CANDIDATE_FILE) if os.path.dirname(CANDIDATE_FILE) else '.', exist_ok=True)
+            # temp_dir 已在模块顶部创建
             with open(CANDIDATE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
 
@@ -605,29 +635,80 @@ class StockSelector:
             logger.error(f"保存结果失败: {e}")
 
     def _save_first_limit_stocks(self, stock_codes: List[str]):
-        """保存首板股票到firstlimit.csv文件"""
+        """保存首板股票到firstlimit.csv文件（包含开盘价、收盘价和前一交易日收盘价）"""
         try:
             import csv
-            csv_file = "firstlimit.csv"
+            csv_file = temp_dir / "firstlimit.csv"
 
-            # 获取股票名称
+            logger.info(f"获取首板股票的开盘价、收盘价和前一交易日收盘价...")
+
+            # 判断当前时间，确定要获取哪一天的数据
+            now = datetime.datetime.now()
+            # 交易时间：9:30-15:00
+            start_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            end_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
+
+            # 如果是盘后时间（15:00之后），使用当日数据；否则使用上个交易日数据
+            is_after_trading = now >= end_time
+            data_date_desc = "当日" if is_after_trading else "上个交易日"
+
+            logger.info(f"当前时间: {now.strftime('%H:%M:%S')}, 使用{data_date_desc}的开盘价和收盘价")
+
+            # 获取首板股票的开盘价、收盘价和前一交易日收盘价
             stocks_data = []
+            price_data = {}
+
+            if not self.use_mock_data and stock_codes:
+                # 获取2日数据用于获取开盘价、收盘价和前一交易日收盘价
+                try:
+                    price_data = self.get_market_data_ex_with_trading_dates(
+                        fields=['open', 'close', 'preClose'],
+                        stock_list=stock_codes,
+                        period='1d',
+                        count=2  # 获取最新的2天数据（需要前一日的preClose）
+                    )
+                    logger.info(f"成功获取 {len(price_data)} 只股票的价格数据")
+                except Exception as e:
+                    logger.warning(f"获取价格数据失败: {e}")
+
+            # 整理数据
             for code in stock_codes:
                 name = self.get_stock_name(code)
-                stocks_data.append([code, name])
+
+                # 获取开盘价、收盘价和前一交易日收盘价
+                open_price = "-"
+                close_price = "-"
+                pre_close = "-"
+
+                if code in price_data and len(price_data[code]) > 0:
+                    df = price_data[code]
+                    # 获取首板当天的数据（最后一条记录）
+                    if len(df) >= 1:
+                        open_price = df.iloc[-1]['open']
+                        close_price = df.iloc[-1]['close']
+                        # 保留2位小数
+                        open_price = round(open_price, 2) if open_price else "-"
+                        close_price = round(close_price, 2) if close_price else "-"
+
+                    # 获取前一交易日的收盘价（preClose字段）
+                    if len(df) >= 1:
+                        pre_close = df.iloc[-1]['preClose']
+                        pre_close = round(pre_close, 2) if pre_close else "-"
+
+                stocks_data.append([code, name, open_price, close_price, pre_close])
 
             # 保存到CSV文件
             with open(csv_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 # 写入表头
-                writer.writerow(['股票代码', '股票名称'])
+                writer.writerow(['股票代码', '股票名称', f'{data_date_desc}开盘价', f'{data_date_desc}收盘价', '前一交易日收盘价'])
                 # 写入数据
                 writer.writerows(stocks_data)
 
-            logger.info(f"首板股票已保存至 {csv_file}，共 {len(stock_codes)} 只")
+            logger.info(f"首板股票已保存至 {csv_file}，共 {len(stock_codes)} 只，{data_date_desc}价格")
 
         except Exception as e:
-            logger.error(f"保存首板股票失败: {e}")
+            logger.error(f"保存首板股票失败: {e}", exc_info=True)
 
     # 以下是需要根据miniQMT实际API实现的方法
     def get_market_data_ex(self, fields: List[str], stock_list: List[str], period: str, count: int) -> Dict:
