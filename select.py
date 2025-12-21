@@ -481,6 +481,50 @@ class StockSelector:
             logger.error(f"{code} 回撤计算异常: {e}")
             return False
 
+    def filter_by_sell_orders(self, candidates: List[str]) -> List[str]:
+        """
+        通过Tick数据过滤掉有卖单的股票（非封板）
+        卖一量 > 0 表示未封死
+        """
+        logger.info("开始通过Tick数据过滤未封板股票...")
+        if not candidates:
+            return []
+
+        final_list = []
+        try:
+            from xtquant import xtdata
+            # 获取全推Tick数据
+            ticks = xtdata.get_full_tick(candidates)
+            
+            for code in candidates:
+                if code not in ticks:
+                    # 如果获取不到Tick数据，暂且保留
+                    final_list.append(code)
+                    continue
+                    
+                tick = ticks[code]
+                # 检查卖一量
+                # askVol 是一个列表或数组，index 0 为卖一
+                has_sell_order = False
+                if 'askVol' in tick:
+                    ask_vols = tick['askVol']
+                    # 确保是列表/数组且长度大于0
+                    if hasattr(ask_vols, '__len__') and len(ask_vols) > 0:
+                         if ask_vols[0] > 0:
+                            has_sell_order = True
+                
+                if has_sell_order:
+                    logger.info(f"剔除 {code}: 存在卖单 (卖一量: {tick['askVol'][0]})")
+                else:
+                    final_list.append(code)
+
+        except Exception as e:
+            logger.error(f"Tick数据过滤失败: {e}")
+            return candidates # 发生错误时返回原列表
+            
+        logger.info(f"Tick过滤完成: {len(candidates)} -> {len(final_list)}")
+        return final_list
+
     def run_selection(self) -> Optional[List[str]]:
         """
         执行完整的选股流程
@@ -561,6 +605,10 @@ class StockSelector:
                         log_selection(f"首板: {code}")
 
             logger.info(f"统计: 总股票数={total_stocks}, 有数据股票数={stocks_with_data}")
+
+            # 3.1 盘口验证：剔除有卖单的股票（针对首板必须封死）
+            if limit_up_candidates and not self.use_mock_data:
+                limit_up_candidates = self.filter_by_sell_orders(limit_up_candidates)
 
             # 记录筛选结果
             if today_is_trading_day:
