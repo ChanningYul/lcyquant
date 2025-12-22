@@ -69,6 +69,7 @@ class StockSelector:
             self.params = PARAMS.copy()
         except ImportError:
             # 如果配置文件不存在，使用默认值
+            logger.warning("select_config.py 不存在，使用默认参数")
             self.params = {
                 'limit_ratio_main': 0.10,  # 沪深A股涨停幅度
                 'limit_ratio_special': 0.20,  # 创业板涨停幅度
@@ -77,7 +78,7 @@ class StockSelector:
                 'drawdown_limit': 0.15,  # 最大回撤率（默认15%）
                 'stop_profit': 0.10,  # 止盈比例
                 'stop_loss': -0.02,  # 止损比例
-                'seal_circ_ratio': 0.03,  # 封单对流通市值占比
+                'seal_circ_ratio': 0.000003,  # 封单对流通市值占比
                 'seal_turnover_ratio': 2.0,  # 封单占成交额倍数
                 'enable_seal_filter': True,  # 是否启用封单金额筛选
             }
@@ -557,27 +558,27 @@ class StockSelector:
 
                 tick = ticks[code]
 
-                # 1. 获取盘口数据：卖一档价格和数量
-                ask1_price = None
-                ask1_volume = None
+                # 1. 获取盘口数据：买一档价格和数量（涨停股看买一）
+                bid1_price = None
+                bid1_volume = None
 
-                if 'askPrice' in tick and 'askVol' in tick:
-                    ask_prices = tick['askPrice']
-                    ask_vols = tick['askVol']
+                if 'bidPrice' in tick and 'bidVol' in tick:
+                    bid_prices = tick['bidPrice']
+                    bid_vols = tick['bidVol']
 
                     # 确保是列表/数组且长度大于0
-                    if (hasattr(ask_prices, '__len__') and len(ask_prices) > 0 and
-                        hasattr(ask_vols, '__len__') and len(ask_vols) > 0):
-                        ask1_price = ask_prices[0]
-                        ask1_volume = ask_vols[0]
+                    if (hasattr(bid_prices, '__len__') and len(bid_prices) > 0 and
+                        hasattr(bid_vols, '__len__') and len(bid_vols) > 0):
+                        bid1_price = bid_prices[0]
+                        bid1_volume = bid_vols[0]
 
-                if ask1_price is None or ask1_volume is None:
+                if bid1_price is None or bid1_volume is None:
                     logger.warning(f"{code}: 无法获取盘口数据，跳过封单筛选")
                     final_list.append(code)
                     continue
 
                 # 2. 计算封单金额
-                seal_amount = ask1_price * ask1_volume
+                seal_amount = bid1_price * bid1_volume * 100
 
                 # 3. 获取流通市值
                 circ_market_value = None
@@ -656,8 +657,8 @@ class StockSelector:
                     log_selection(f"封单筛选通过 {code}: 封单金额={seal_amount:.0f}, 流通市值占比={seal_amount/circ_market_value:.2%}, 成交额倍数={seal_amount/turnover_amount:.2f}")
                     final_list.append(code)
                 else:
-                    reason1 = f"封单{seal_amount:.0f} < {seal_circ_threshold:.0f}" if not condition1 else ""
-                    reason2 = f"封单{seal_amount:.0f} < {seal_turnover_threshold:.0f}" if not condition2 else ""
+                    reason1 = f"封单{seal_amount:.0f} < {self.params['seal_circ_ratio']:.2%}的流通市值{seal_circ_threshold:.0f}" if not condition1 else ""
+                    reason2 = f"封单{seal_amount:.0f} < {self.params['seal_turnover_ratio']:.2%}的成交额{seal_turnover_threshold:.0f}" if not condition2 else ""
                     reason = " AND ".join([r for r in [reason1, reason2] if r])
                     logger.info(f"剔除 {code}: {reason}")
                     log_selection(f"封单筛选剔除 {code}: {reason}")

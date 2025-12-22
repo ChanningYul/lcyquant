@@ -28,7 +28,7 @@ if xtquant_path.exists():
 from xtquant import xtdata
 
 # 配置日志
-def setup_logging(log_file: str = "download_all_stocks.log"):
+def setup_logging(log_file: str = "log/download_all_stocks.log"):
     """配置日志（输出到stderr，避免干扰进度条）"""
     logging.basicConfig(
         level=logging.INFO,
