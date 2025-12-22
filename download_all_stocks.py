@@ -52,11 +52,14 @@ def parse_arguments():
   python download_all_stocks.py --days 30               # 下载近30个交易日数据
   python download_all_stocks.py --resume                # 断点续传（从上次中断的地方继续）
   python download_all_stocks.py --no-smart-increment    # 禁用智能增量，每次完整下载
+  python download_all_stocks.py --force-today           # 强制更新当日数据（盘中也可获取完整数据）
 
 智能增量更新说明：
   - 默认启用智能增量更新，会自动检测本地数据，只下载缺失的部分
   - 第一次运行时下载完整历史数据
   - 后续运行只下载新产生的数据，大大节省时间
+  - 当日数据智能判断：盘后时间（15:00后）自动重新下载完整数据
+  - 使用 --force-today 可强制在盘中时间也重新下载完整数据
         """
     )
 
@@ -73,6 +76,8 @@ def parse_arguments():
                         help='启用智能增量更新（自动检测本地数据，仅下载缺失部分，默认启用）')
     parser.add_argument('--no-smart-increment', action='store_false', dest='smart_increment',
                         help='禁用智能增量更新，每次都完整下载')
+    parser.add_argument('--force-today', action='store_true',
+                        help='强制更新当日数据（即使在盘中时间也会下载，避免盘中数据不完整的问题）')
 
     return parser.parse_args()
 
@@ -177,8 +182,14 @@ def save_downloaded_stocks(downloaded_stocks: set, resume_file: str):
     except Exception as e:
         print(f"保存断点续传文件失败: {e}")
 
-def get_latest_data_date(symbol: str, period: str, logger) -> Optional[str]:
-    """获取本地数据的最新日期"""
+def get_latest_data_date(symbol: str, period: str, logger) -> Tuple[Optional[str], Optional[str]]:
+    """获取本地数据的最新日期和数据时间戳
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: (最新日期, 最新数据的时间戳)
+        最新日期: YYYYMMDD格式的字符串
+        最新数据时间戳: 毫秒级时间戳，用于判断数据是否是当天的盘中数据
+    """
     try:
         # 获取最近的数据（获取close字段，因为time字段可能不是所有周期都有）
         # 对于1d周期，close字段一定有数据
@@ -201,12 +212,34 @@ def get_latest_data_date(symbol: str, period: str, logger) -> Optional[str]:
                 latest_timestamp = stock_data.index[-1]  # 最新的时间戳
                 # 转换为日期字符串格式 (YYYYMMDD)
                 latest_date = datetime.fromtimestamp(latest_timestamp / 1000).strftime('%Y%m%d')
-                logger.debug(f"{symbol} 本地最新数据日期: {latest_date}")
-                return latest_date
-        return None
+                logger.debug(f"{symbol} 本地最新数据日期: {latest_date}, 时间戳: {latest_timestamp}")
+                return latest_date, latest_timestamp
+        return None, None
     except Exception as e:
         logger.debug(f"获取 {symbol} 本地数据日期失败: {str(e)[:80]}")
-        return None
+        return None, None
+
+def is_after_trading_hours() -> bool:
+    """判断当前是否在A股收盘后（15:00之后）
+
+    Returns:
+        bool: True表示在15:00之后或周末，False表示在盘中或盘前
+    """
+    now = datetime.now()
+    # 获取当前时间的小时和分钟
+    hour = now.hour
+    minute = now.minute
+
+    # 周末直接返回True（盘后）
+    weekday = now.weekday()
+    if weekday >= 5:  # 5=周六, 6=周日
+        return True
+
+    # 如果是工作日，检查是否在15:00之后
+    if hour > 15 or (hour == 15 and minute >= 0):
+        return True
+
+    return False
 
 def download_stock_data_no_increment(symbol: str, start_date: str, end_date: str, period: str, retry: int, logger) -> bool:
     """下载单只股票数据（传统方式，不使用增量下载）"""
@@ -222,7 +255,7 @@ def download_stock_data_no_increment(symbol: str, start_date: str, end_date: str
                 logger.warning(f"{symbol} 下载最终失败: {str(e)[:80]}")
     return False
 
-def download_stock_data(symbol: str, start_date: str, end_date: str, period: str, retry: int, logger) -> str:
+def download_stock_data(symbol: str, start_date: str, end_date: str, period: str, retry: int, force_today: bool, logger) -> str:
     """
     下载单只股票数据（智能增量更新）
     返回值：
@@ -233,7 +266,7 @@ def download_stock_data(symbol: str, start_date: str, end_date: str, period: str
     for attempt in range(retry):
         try:
             # 检查本地是否已有数据
-            latest_date = get_latest_data_date(symbol, period, logger)
+            latest_date, latest_timestamp = get_latest_data_date(symbol, period, logger)
 
             if latest_date:
                 # 本地已有数据，计算需要增量下载的起始日期
@@ -245,8 +278,28 @@ def download_stock_data(symbol: str, start_date: str, end_date: str, period: str
                 target_date_obj = datetime.strptime(end_date, '%Y%m%d')
 
                 if start_time > end_date:
-                    # 数据已是最新，跳过下载
-                    return 'skipped'
+                    # 数据日期已是最新的，需要进一步判断当日数据是否需要更新
+
+                    # 获取今天的日期字符串
+                    today_str = datetime.now().strftime('%Y%m%d')
+
+                    # 如果最新数据是今天的数据，需要判断是否需要重新下载
+                    if latest_date == today_str:
+                        # 如果启用了强制更新当日数据，或者当前是盘后时间，重新下载以获取完整数据
+                        if force_today or is_after_trading_hours():
+                            if force_today:
+                                logger.debug(f"{symbol} 强制更新今日数据（--force-today参数）")
+                            else:
+                                logger.debug(f"{symbol} 当前为盘后时间，重新下载今日完整数据")
+                            xtdata.download_history_data(symbol, period, start_time=start_date, end_time=end_date)
+                        else:
+                            # 数据已是最新，跳过下载
+                            logger.debug(f"{symbol} 数据已是最新，跳过下载")
+                            return 'skipped'
+                    else:
+                        # 数据已是最新，跳过下载
+                        logger.debug(f"{symbol} 数据已是最新，跳过下载")
+                        return 'skipped'
                 else:
                     # 增量下载
                     xtdata.download_history_data(symbol, period, start_time=start_time, end_time=end_date)
@@ -287,7 +340,8 @@ def reconnect_qmt(logger) -> bool:
 
 def download_all_stocks_process(stocks: List[Tuple[str, str]], start_date: str, end_date: str,
                                period: str, retry: int, delay: float,
-                               downloaded_stocks: set, resume_file: str, smart_increment: bool, logger):
+                               downloaded_stocks: set, resume_file: str, smart_increment: bool,
+                               force_today: bool, logger):
     """下载所有股票数据（无批次处理）"""
 
     # 创建进度条（输出到stderr，确保在同一行刷新）
@@ -326,7 +380,7 @@ def download_all_stocks_process(stocks: List[Tuple[str, str]], start_date: str, 
         # 下载数据
         if smart_increment:
             # 使用智能增量下载
-            result = download_stock_data(symbol, start_date, end_date, period, retry, logger)
+            result = download_stock_data(symbol, start_date, end_date, period, retry, force_today, logger)
             if result == 'skipped':
                 # 数据已是最新，跳过下载
                 skip_count += 1
@@ -406,6 +460,7 @@ def main():
         logger.info(f"重试次数: {args.retry}")
         logger.info(f"下载间隔: {args.delay}秒")
         logger.info(f"智能增量更新: {'启用' if args.smart_increment else '禁用'}")
+        logger.info(f"强制更新当日数据: {'是' if args.force_today else '否'}")
 
         # 加载已下载股票列表（总是加载，支持智能增量）
         resume_file = "downloaded_stocks.json"
@@ -428,7 +483,8 @@ def main():
         download_all_stocks_process(
             stocks, start_date, end_date, args.period,
             args.retry, args.delay,
-            downloaded_stocks, resume_file, args.smart_increment, logger
+            downloaded_stocks, resume_file, args.smart_increment,
+            args.force_today, logger
         )
 
     except KeyboardInterrupt:

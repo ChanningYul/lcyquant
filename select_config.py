@@ -36,8 +36,8 @@ PARAMS = {
     'stop_loss': -0.02,  # 止损比例
 
     # L2数据过滤
-    'seal_circ_ratio': 0.0003,  # 封单对流通市值占比
-    'seal_turnover_ratio': 0.001,  # 封单占成交额倍数
+    'seal_circ_ratio': 0.000003,  # 封单对流通市值占比
+    'seal_turnover_ratio': 0.00001,  # 封单占成交额倍数
     'enable_seal_filter': True,  # 是否启用封单金额筛选
 }
 
