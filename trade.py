@@ -109,14 +109,216 @@ def do_sell(ContextInfo, stock_code, price, volume, msg):
         print(f"卖出异常: {e}")
 
 def run_night_order_task(ContextInfo):
-    """夜间挂单任务（选股逻辑已移除，仅保留交易执行接口）"""
-    print(f"[{datetime.datetime.now()}] 夜间挂单任务已调用")
-    print("注意：选股逻辑已从trade.py中移除，请通过外部传入候选股票进行交易")
+    """夜间挂单任务（20:30执行）- 为候选股票挂次日涨停价买单"""
+    print(f"\n[{datetime.datetime.now()}] === 夜间挂单任务开始 ===")
+    try:
+        # 1. 读取候选股票列表
+        candidate_file = 'data/candidate.json'
+        candidates = []
+        try:
+            import json
+            with open(candidate_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                candidates = data.get('candidates', [])
+                print(f"读取到 {len(candidates)} 只候选股票")
+        except Exception as e:
+            print(f"读取候选股票列表失败: {e}")
+            return
+
+        if not candidates:
+            print("候选股票列表为空，无需挂单")
+            return
+
+        # 2. 获取可用资金
+        try:
+            asset = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'asset')
+            if asset:
+                available_cash = asset[0].m_dAvailableCash if hasattr(asset[0], 'm_dAvailableCash') else asset[0].m_dEnableBalance
+                print(f"可用资金: {available_cash:.2f}")
+            else:
+                print("获取资金信息失败")
+                return
+        except Exception as e:
+            print(f"获取资金信息异常: {e}")
+            return
+
+        # 3. 计算单票仓位（全仓除以候选股票数）
+        if len(candidates) > 0:
+            position_per_stock = available_cash / len(candidates)
+            print(f"单票预算资金: {position_per_stock:.2f}")
+
+        # 4. 为每只候选股票挂涨停价买单
+        for stock_code in candidates:
+            try:
+                # 获取昨日收盘价
+                last_close = ContextInfo.get_last_close(stock_code)
+                if last_close <= 0:
+                    print(f"跳过 {stock_code}: 无法获取昨收价")
+                    continue
+
+                # 计算涨停价（根据板块不同，涨停幅度不同）
+                if stock_code.startswith('30') or stock_code.startswith('68'):
+                    # 创业板/科创板 20%
+                    limit_up_price = last_close * 1.20
+                elif stock_code.startswith('8') or stock_code.startswith('4'):
+                    # 北交所 30%
+                    limit_up_price = last_close * 1.30
+                else:
+                    # 主板 10%
+                    limit_up_price = last_close * 1.10
+
+                # 计算买入数量（按涨停价计算）
+                volume = int(position_per_stock / limit_up_price / 100) * 100  # 确保是100的整数倍
+
+                if volume <= 0:
+                    print(f"跳过 {stock_code}: 计算买入数量为0")
+                    continue
+
+                print(f"挂单: {stock_code}, 昨收: {last_close:.2f}, 涨停价: {limit_up_price:.2f}, 数量: {volume}")
+
+                # 挂买单（11是买入）
+                if 'pass_order' in globals():
+                    # 使用 pass_order 接口
+                    pass_order(23, 1101, ContextInfo.account_id, stock_code, 11, limit_up_price, volume,
+                              f'夜间挂单-{datetime.datetime.now().strftime("%Y%m%d")}', 2, "", ContextInfo)
+                else:
+                    # 使用 ContextInfo 的接口
+                    ContextInfo.buy_stock(stock_code, volume, ContextInfo.account_id)
+
+            except Exception as e:
+                print(f"挂单失败 {stock_code}: {e}")
+                continue
+
+        print(f"[{datetime.datetime.now()}] === 夜间挂单任务完成 ===\n")
+
+    except Exception as e:
+        print(f"夜间挂单任务异常: {e}")
 
 def run_morning_check_task(ContextInfo):
-    """晨间校验任务（选股逻辑已移除，仅保留交易执行接口）"""
-    print(f"[{datetime.datetime.now()}] 晨间校验任务已调用")
-    print("注意：选股逻辑已从trade.py中移除，请通过外部传入候选股票进行交易")
+    """晨间校验任务（09:25执行）- 校验前一晚的挂单是否成功，如失败则补充挂单"""
+    print(f"\n[{datetime.datetime.now()}] === 晨间校验任务开始 ===")
+    try:
+        # 1. 读取候选股票列表
+        candidate_file = 'data/candidate.json'
+        candidates = []
+        try:
+            import json
+            with open(candidate_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                candidates = data.get('candidates', [])
+                print(f"候选股票总数: {len(candidates)} 只")
+        except Exception as e:
+            print(f"读取候选股票列表失败: {e}")
+            return
+
+        if not candidates:
+            print("候选股票列表为空，无需校验")
+            return
+
+        # 2. 获取当前持仓
+        positions = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'position')
+
+        # 3. 获取候选股票在持仓中的情况
+        held_stocks = set()
+        for pos in positions:
+            code = pos.m_strInstrumentID
+            volume = pos.m_nVolume
+            if volume > 0:
+                held_stocks.add(code)
+
+        print(f"当前已持仓股票: {len(held_stocks)} 只")
+        print(f"候选股票中已买入: {len(held_stocks.intersection(candidates))} 只")
+
+        # 4. 检查哪些候选股票未成功买入
+        not_buied = [code for code in candidates if code not in held_stocks]
+
+        if not not_buied:
+            print("✓ 所有候选股票均已成功买入，无需补充挂单")
+            print(f"[{datetime.datetime.now()}] === 晨间校验任务完成 ===\n")
+            return
+
+        print(f"\n⚠ 发现 {len(not_buied)} 只候选股票未成功买入，将补充挂单:")
+        for code in not_buied:
+            print(f"  - {code}")
+
+        # 5. 获取可用资金
+        try:
+            asset = ContextInfo.get_trade_detail_data(ContextInfo.account_id, 'stock', 'asset')
+            if asset:
+                available_cash = asset[0].m_dAvailableCash if hasattr(asset[0], 'm_dAvailableCash') else asset[0].m_dEnableBalance
+                print(f"\n可用资金: {available_cash:.2f}")
+            else:
+                print("获取资金信息失败")
+                return
+        except Exception as e:
+            print(f"获取资金信息异常: {e}")
+            return
+
+        # 6. 计算补充挂单数量（重新平均分配给未成功的股票）
+        if len(not_buied) > 0:
+            position_per_stock = available_cash / len(not_buied)
+            print(f"补充挂单单票预算资金: {position_per_stock:.2f}")
+
+        # 7. 为未成功的股票补充挂单
+        success_count = 0
+        fail_count = 0
+
+        for stock_code in not_buied:
+            try:
+                # 获取昨日收盘价
+                last_close = ContextInfo.get_last_close(stock_code)
+                if last_close <= 0:
+                    print(f"跳过 {stock_code}: 无法获取昨收价")
+                    fail_count += 1
+                    continue
+
+                # 计算涨停价（根据板块不同）
+                if stock_code.startswith('30') or stock_code.startswith('68'):
+                    # 创业板/科创板 20%
+                    limit_up_price = last_close * 1.20
+                elif stock_code.startswith('8') or stock_code.startswith('4'):
+                    # 北交所 30%
+                    limit_up_price = last_close * 1.30
+                else:
+                    # 主板 10%
+                    limit_up_price = last_close * 1.10
+
+                # 计算买入数量（按涨停价计算）
+                volume = int(position_per_stock / limit_up_price / 100) * 100  # 确保是100的整数倍
+
+                if volume <= 0:
+                    print(f"跳过 {stock_code}: 计算买入数量为0")
+                    fail_count += 1
+                    continue
+
+                print(f"补充挂单: {stock_code}, 昨收: {last_close:.2f}, 涨停价: {limit_up_price:.2f}, 数量: {volume}")
+
+                # 挂买单（11是买入）
+                if 'pass_order' in globals():
+                    # 使用 pass_order 接口
+                    pass_order(23, 1101, ContextInfo.account_id, stock_code, 11, limit_up_price, volume,
+                              f'补充挂单-{datetime.datetime.now().strftime("%Y%m%d")}', 2, "", ContextInfo)
+                else:
+                    # 使用 ContextInfo 的接口
+                    ContextInfo.buy_stock(stock_code, volume, ContextInfo.account_id)
+
+                success_count += 1
+
+            except Exception as e:
+                print(f"补充挂单失败 {stock_code}: {e}")
+                fail_count += 1
+                continue
+
+        # 8. 输出校验结果
+        print(f"\n=== 晨间校验结果 ===")
+        print(f"候选股票总数: {len(candidates)}")
+        print(f"已成功买入: {len(candidates) - len(not_buied)}")
+        print(f"本次补充挂单: {success_count}")
+        print(f"补充挂单失败: {fail_count}")
+        print(f"[{datetime.datetime.now()}] === 晨间校验任务完成 ===\n")
+
+    except Exception as e:
+        print(f"晨间校验任务异常: {e}")
 
 def check_is_limit_up_now(ContextInfo, code):
     """检查当前是否涨停"""
