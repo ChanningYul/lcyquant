@@ -63,7 +63,6 @@ class StockSelector:
 
     def __init__(self):
         self.stock_list = []
-        self.use_mock_data = False  # 标记是否使用模拟数据（默认使用真实数据）
         self.trading_calendar = []  # 交易日历
         # 从配置文件读取参数
         try:
@@ -89,31 +88,19 @@ class StockSelector:
         """初始化数据：获取股票列表和交易日历"""
         logger.info("开始初始化数据...")
 
-        # 临时解决方案：直接使用模拟数据模式
-        # 原因：QMT SDK 存在BSON错误，无法通过异常处理完全规避
-        logger.warning("=" * 60)
-        logger.warning("检测到QMT SDK存在BSON错误风险，使用模拟数据模式")
-        logger.warning("如需使用真实数据，请手动设置 use_mock_data = False")
-        logger.warning("=" * 60)
-        return self.init_data_mock()
-
-        """
-        # 原始代码（已临时禁用）
         try:
             # 使用xtQuant接口获取股票列表
-            # xtdata.get_stock_list_in_sector() 返回股票代码列表
             from xtquant import xtdata
 
-            # 尝试获取股票列表，BSON错误时切换到模拟数据
+            # 尝试获取股票列表
             try:
                 self.stock_list = xtdata.get_stock_list_in_sector('沪深A股')
                 logger.info(f"获取到 {len(self.stock_list)} 只股票")
             except (AssertionError, Exception) as e:
-                # BSON错误：切换到模拟数据
+                # BSON错误处理
                 error_msg = str(e)[:100]
                 logger.error(f"BSON错误，无法获取股票列表: {error_msg}")
-                logger.error("检测到QMT SDK内部错误，切换到模拟数据模式")
-                return self.init_data_mock()
+                raise
 
             # 获取交易日历
             try:
@@ -132,32 +119,7 @@ class StockSelector:
             return True
         except Exception as e:
             logger.error(f"初始化数据失败: {e}")
-            logger.warning("尝试使用模拟数据进行测试...")
-            return self.init_data_mock()
-        """
-
-    def init_data_mock(self):
-        """使用模拟数据初始化（用于测试）"""
-        logger.info("使用模拟数据初始化...")
-        self.use_mock_data = True  # 标记使用模拟数据
-        # 生成模拟股票列表
-        self.stock_list = []
-        # 模拟主板股票
-        for i in range(50):
-            code = f"{600000 + i:06d}"
-            self.stock_list.append(code)
-        # 模拟深市股票
-        for i in range(50):
-            code = f"{1 + i:06d}"
-            self.stock_list.append(code)
-
-        logger.info(f"模拟数据: 生成 {len(self.stock_list)} 只股票")
-        return True
-
-    def _get_stock_list_fallback(self) -> List[str]:
-        """备用股票列表获取方法"""
-        # 这里实现备用逻辑，例如从文件读取或使用其他API
-        return []
+            raise
 
     def filter_basic_criteria(self) -> List[str]:
         """
@@ -167,27 +129,26 @@ class StockSelector:
 
         # 批量获取停牌状态
         suspended_stocks = set()
-        if not self.use_mock_data:
-            try:
-                from xtquant import xtdata
-                # 获取所有股票的最近1条日线数据的suspendFlag
-                # suspendFlag: 0-正常, 1-停牌
-                data = xtdata.get_market_data(
-                    field_list=['suspendFlag'],
-                    stock_list=self.stock_list,
-                    period='1d',
-                    count=1
-                )
-                if 'suspendFlag' in data:
-                    df = data['suspendFlag']
-                    if not df.empty:
-                        # 获取最后一列（最新日期）
-                        last_col = df.iloc[:, -1]
-                        # 找出值为1（停牌）的股票
-                        suspended_stocks = set(last_col[last_col == 1].index)
-                        logger.info(f"识别出 {len(suspended_stocks)} 只停牌股票")
-            except Exception as e:
-                logger.warning(f"获取停牌状态失败: {e}")
+        try:
+            from xtquant import xtdata
+            # 获取所有股票的最近1条日线数据的suspendFlag
+            # suspendFlag: 0-正常, 1-停牌
+            data = xtdata.get_market_data(
+                field_list=['suspendFlag'],
+                stock_list=self.stock_list,
+                period='1d',
+                count=1
+            )
+            if 'suspendFlag' in data:
+                df = data['suspendFlag']
+                if not df.empty:
+                    # 获取最后一列（最新日期）
+                    last_col = df.iloc[:, -1]
+                    # 找出值为1（停牌）的股票
+                    suspended_stocks = set(last_col[last_col == 1].index)
+                    logger.info(f"识别出 {len(suspended_stocks)} 只停牌股票")
+        except Exception as e:
+            logger.warning(f"获取停牌状态失败: {e}")
 
         valid_stocks = []
 
@@ -225,10 +186,6 @@ class StockSelector:
     def get_stock_name(self, code: str) -> str:
         """获取股票名称"""
         try:
-            # 如果使用模拟数据，返回模拟名称
-            if self.use_mock_data:
-                return f"股票{code}"
-
             # 尝试通过xtdata获取真实股票名称
             from xtquant import xtdata
             try:
@@ -271,10 +228,6 @@ class StockSelector:
         交易前：返回前N个完整交易日
         交易后：返回前N-1个完整交易日 + 当日
         """
-        if self.use_mock_data:
-            # 模拟数据模式下，返回模拟日期
-            return []
-
         # 如果有交易日历，使用交易日历
         if self.trading_calendar:
             recent_dates = sorted(self.trading_calendar, reverse=True)
@@ -311,9 +264,6 @@ class StockSelector:
         """
         根据交易日历获取市场数据（使用交易日期而非自然日期）
         """
-        if self.use_mock_data:
-            return self.get_market_data_mock(fields, stock_list, period, count)
-
         # QMT极简版不支持start_time和end_time参数，使用count参数
         # fill_data=False 直接获取实际交易日数据，不填充周末等非交易日
         logger.info(f"使用count参数直接获取{count}条交易日数据")
@@ -396,11 +346,26 @@ class StockSelector:
         except Exception as e:
             logger.error(f"获取市场数据失败: {e}")
             return {}
+
     def get_current_price(self, code: str) -> float:
         """获取当前价格"""
-        # 返回模拟价格
-        import random
-        return round(random.uniform(5, 100), 2)
+        try:
+            from xtquant import xtdata
+            # 获取最新价格
+            data = xtdata.get_market_data(
+                field_list=['close'],
+                stock_list=[code],
+                period='1d',
+                count=1
+            )
+            if 'close' in data and len(data['close']) > 0:
+                df = data['close']
+                if code in df.index and len(df.columns) > 0:
+                    return float(df.iloc[0, -1])
+            return 0.0
+        except Exception as e:
+            logger.warning(f"获取 {code} 当前价格失败: {e}")
+            return 0.0
 
     def is_limit_up_bar(self, code: str, bar: Dict, is_today: bool = False) -> bool:
         """
@@ -767,7 +732,7 @@ class StockSelector:
             logger.info(f"统计: 总股票数={total_stocks}, 有数据股票数={stocks_with_data}")
 
             # 3.1 盘口验证：剔除有卖单的股票（针对首板必须封死）
-            if limit_up_candidates and not self.use_mock_data:
+            if limit_up_candidates:
                 limit_up_candidates = self.filter_by_sell_orders(limit_up_candidates)
 
             # 记录筛选结果
@@ -836,7 +801,7 @@ class StockSelector:
                 final_list.append(code)
 
             # 6. 封单金额筛选
-            if final_list and not self.use_mock_data:
+            if final_list:
                 final_list = self.filter_by_seal_amount(final_list)
 
             # 7. 可选：高级筛选（L2数据、龙虎榜等）
@@ -904,7 +869,7 @@ class StockSelector:
             stocks_data = []
             price_data = {}
 
-            if not self.use_mock_data and stock_codes:
+            if stock_codes:
                 # 获取2日数据用于获取开盘价、收盘价和前一交易日收盘价
                 try:
                     price_data = self.get_market_data_ex_with_trading_dates(
@@ -962,11 +927,6 @@ class StockSelector:
         批量获取市场数据
         使用xtdata接口获取历史数据
         """
-        # 如果是模拟数据模式，直接使用模拟数据
-        if self.use_mock_data:
-            logger.info(f"模拟数据模式: 直接生成 {len(stock_list)} 只股票的历史数据")
-            return self.get_market_data_mock(fields, stock_list, period, count)
-
         result = {}
         try:
             from xtquant import xtdata
@@ -1000,74 +960,8 @@ class StockSelector:
             return result
 
         except Exception as e:
-            logger.warning(f"获取市场数据失败，使用模拟数据: {e}")
-            return self.get_market_data_mock(fields, stock_list, period, count)
-
-    def get_market_data_mock(self, fields: List[str], stock_list: List[str],
-                            period: str, count: int) -> Dict:
-        """生成模拟历史数据（包含涨停股票）"""
-        import pandas as pd
-        import random
-        from datetime import datetime, timedelta
-
-        result = {}
-        # 设定涨停股票比例（约20%的股票会涨停）
-        limit_up_count = max(1, len(stock_list) // 5)
-        limit_up_stocks = set(random.sample(stock_list, limit_up_count))
-
-        logger.info(f"模拟数据: 将生成 {limit_up_count} 只涨停股票 (共 {len(stock_list)} 只)")
-
-        for code in stock_list:
-            # 生成日期序列
-            end_date = datetime.now().date()
-            dates = [end_date - timedelta(days=i) for i in range(count)]
-            dates.reverse()
-
-            # 生成模拟数据
-            base_price = random.uniform(10, 100)
-            data = []
-
-            for i, date in enumerate(dates):
-                # 对于涨停股票，在最后一天设置为涨停
-                is_last_day = (i == len(dates) - 1)
-                is_limit_up_stock = code in limit_up_stocks
-
-                if is_last_day and is_limit_up_stock:
-                    # 涨停股票：生成涨停数据
-                    pre_close = base_price
-                    # 涨停价 = 昨收 * 1.10 (主板)
-                    limit_price = round(pre_close * 1.10, 2)
-                    close_price = limit_price
-                    high_price = limit_price
-                    low_price = pre_close + random.uniform(0, 0.5)  # 最低价接近昨收
-                    open_price = round(random.uniform(pre_close, limit_price), 2)
-                else:
-                    # 普通股票：随机游走
-                    change = random.uniform(-0.05, 0.05)
-                    base_price = base_price * (1 + change)
-
-                    open_price = base_price + random.uniform(-2, 2)
-                    high_price = open_price + random.uniform(0, 3)
-                    low_price = open_price - random.uniform(0, 3)
-                    close_price = random.uniform(low_price, high_price)
-                    pre_close = close_price + random.uniform(-1, 1)
-
-                row = {
-                    'date': date,
-                    'open': round(open_price, 2),
-                    'high': round(high_price, 2),
-                    'low': round(low_price, 2),
-                    'close': round(close_price, 2),
-                    'preClose': round(pre_close, 2),
-                    'amount': random.uniform(1000000, 10000000),
-                }
-                data.append(row)
-
-            df = pd.DataFrame(data)
-            result[code] = df
-
-        logger.info(f"生成模拟数据: {len(result)} 只股票 x {count} 条记录")
-        return result
+            logger.error(f"获取市场数据失败: {e}")
+            raise
 
 
 def main():
