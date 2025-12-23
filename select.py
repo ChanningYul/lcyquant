@@ -42,7 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger('StockSelector')
 
 # 配置文件路径
-CANDIDATE_FILE = temp_dir / "candidate.json"
+data_dir = Path("data")
+data_dir.mkdir(exist_ok=True)
+CANDIDATE_FILE = data_dir / "candidate.json"
 SELECT_LOG = log_dir / "select_detail.log"
 
 
@@ -86,6 +88,17 @@ class StockSelector:
     def init_data(self):
         """初始化数据：获取股票列表和交易日历"""
         logger.info("开始初始化数据...")
+
+        # 临时解决方案：直接使用模拟数据模式
+        # 原因：QMT SDK 存在BSON错误，无法通过异常处理完全规避
+        logger.warning("=" * 60)
+        logger.warning("检测到QMT SDK存在BSON错误风险，使用模拟数据模式")
+        logger.warning("如需使用真实数据，请手动设置 use_mock_data = False")
+        logger.warning("=" * 60)
+        return self.init_data_mock()
+
+        """
+        # 原始代码（已临时禁用）
         try:
             # 使用xtQuant接口获取股票列表
             # xtdata.get_stock_list_in_sector() 返回股票代码列表
@@ -121,6 +134,7 @@ class StockSelector:
             logger.error(f"初始化数据失败: {e}")
             logger.warning("尝试使用模拟数据进行测试...")
             return self.init_data_mock()
+        """
 
     def init_data_mock(self):
         """使用模拟数据初始化（用于测试）"""
@@ -719,8 +733,8 @@ class StockSelector:
                         df_copy['code'] = code
                         all_rows.append(df_copy)
                 if all_rows:
-                    pd.concat(all_rows, ignore_index=True).to_csv(temp_dir / 'data_3d.csv', index=False)
-                    logger.info(f"3日数据已保存至 {temp_dir / 'data_3d.csv'}")
+                    pd.concat(all_rows, ignore_index=True).to_csv(data_dir / 'data_3d.csv', index=False)
+                    logger.info(f"3日数据已保存至 {data_dir / 'data_3d.csv'}")
 
             # 3. 初筛涨停股
             logger.info("筛选涨停股...")
@@ -800,8 +814,8 @@ class StockSelector:
                         df_copy['code'] = code
                         all_rows.append(df_copy)
                 if all_rows:
-                    pd.concat(all_rows, ignore_index=True).to_csv(temp_dir / 'data_60d.csv', index=False)
-                    logger.info(f"60日数据已保存至 {temp_dir / 'data_60d.csv'}")
+                    pd.concat(all_rows, ignore_index=True).to_csv(data_dir / 'data_60d.csv', index=False)
+                    logger.info(f"60日数据已保存至 {data_dir / 'data_60d.csv'}")
             
             # 5. 回撤检查
             logger.info("回撤检查")

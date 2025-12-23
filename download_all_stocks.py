@@ -463,7 +463,9 @@ def main():
         logger.info(f"强制更新当日数据: {'是' if args.force_today else '否'}")
 
         # 加载已下载股票列表（总是加载，支持智能增量）
-        resume_file = "downloaded_stocks.json"
+        data_dir = Path("data")
+        data_dir.mkdir(exist_ok=True)
+        resume_file = str(data_dir / "downloaded_stocks.json")
         downloaded_stocks = load_downloaded_stocks(resume_file, logger)
         logger.info(f"已加载已下载股票列表: {len(downloaded_stocks)} 只")
 
